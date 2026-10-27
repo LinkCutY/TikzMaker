@@ -1,0 +1,18 @@
+import puppeteer from "puppeteer-core";
+const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+const browser = await puppeteer.launch({ executablePath: EDGE, headless: true, args: ["--no-sandbox", "--disable-gpu", "--hide-scrollbars"] });
+const page = await browser.newPage();
+await page.setViewport({ width: 1680, height: 1040 });
+await page.goto("http://127.0.0.1:8788", { waitUntil: "networkidle2", timeout: 90000 });
+await page.waitForSelector("img.page", { timeout: 90000 });
+await page.click(".cm-content");
+await page.keyboard.down("Control");
+await page.keyboard.press("KeyA");
+await page.keyboard.up("Control");
+await page.keyboard.type("\\begin{tikzpicture}\n  \\node[draw, rounded corners, fill=blue!12, minimum width=4.4cm, minimum height=1.5cm, align=center] at (0,0) {片段模式\\/ 自动补全导言区};\n\\end{tikzpicture}");
+await page.keyboard.press("Escape");
+await new Promise((r) => setTimeout(r, 14000));
+const pill = await page.evaluate(() => [...document.querySelectorAll(".pill")].map((p) => p.textContent?.trim()).join(" | "));
+console.log("pills:", pill);
+await page.screenshot({ path: ".shots/10-fragment-ok.png" });
+await browser.close();

@@ -1,0 +1,18 @@
+import puppeteer from "puppeteer-core";
+const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const b = await puppeteer.launch({ executablePath: EDGE, headless: true, args: ["--no-sandbox", "--disable-gpu"] });
+const p = await b.newPage();
+const errs = [];
+p.on("pageerror", (e) => errs.push("pageerror: " + e.message));
+p.on("console", (m) => { if (m.type() === "error") errs.push("console: " + m.text().slice(0, 200)); });
+await p.goto("http://127.0.0.1:5188", { waitUntil: "networkidle2", timeout: 60000 });
+await wait(2500);
+console.log("topbar:", await p.evaluate(() => [...document.querySelectorAll(".topbar button")].map((x) => x.textContent.trim()).filter(Boolean).join(" | ")));
+await p.evaluate(() => [...document.querySelectorAll(".topbar button")].find((x) => x.textContent.includes("文生 TikZ"))?.click());
+await wait(1500);
+console.log("drawer:", await p.evaluate(() => Boolean(document.querySelector(".drawer"))));
+console.log("textarea:", await p.evaluate(() => Boolean(document.querySelector(".drawer textarea"))));
+console.log("inner:", await p.evaluate(() => (document.querySelector(".drawer")?.innerHTML || "NONE").slice(0, 240)));
+console.log(errs.slice(0, 6).join("\n") || "no errors");
+await b.close();

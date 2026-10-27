@@ -1,0 +1,31 @@
+import puppeteer from "puppeteer-core";
+const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const b = await puppeteer.launch({ executablePath: EDGE, headless: true, args: ["--no-sandbox", "--disable-gpu"] });
+const p = await b.newPage();
+await p.setViewport({ width: 1680, height: 1040 });
+await p.goto("http://127.0.0.1:5188", { waitUntil: "networkidle2", timeout: 90000 });
+await p.waitForSelector(".canvas-svg", { timeout: 60000 });
+await wait(1500);
+// a model id the mock rejects with a DeepSeek-style 400
+await p.evaluate(() => {
+  const raw = localStorage.getItem("tikz-studio:v1");
+  const st = raw ? JSON.parse(raw) : { state: {}, version: 1 };
+  st.state.settings = { ...(st.state.settings || {}), provider: "custom", apiBaseUrl: "http://127.0.0.1:8899/v1", apiKey: "mock-key", apiModel: "deepseek-v4.1-flash", engine: "xelatex" };
+  localStorage.setItem("tikz-studio:v1", JSON.stringify(st));
+});
+await p.reload({ waitUntil: "networkidle2", timeout: 90000 });
+await p.waitForSelector(".canvas-svg", { timeout: 60000 });
+await wait(2200);
+await p.evaluate(() => [...document.querySelectorAll(".topbar button")].find((x) => x.textContent.includes("文生 TikZ"))?.click());
+await p.waitForSelector(".drawer textarea", { timeout: 20000 });
+await p.evaluate(() => [...document.querySelectorAll(".drawer button")].find((x) => x.textContent.includes("图片识别"))?.click());
+await wait(300);
+const input = await p.$('.drawer input[type="file"]');
+await input.uploadFile("D:\\FDU_AIagentDevelop\\.shots\\panelb-orig.png");
+await wait(2500);
+await p.evaluate(() => [...document.querySelectorAll(".drawer button")].find((x) => x.textContent.includes("逐块识别"))?.click());
+await wait(6000);
+console.log("steps:", await p.evaluate(() => [...document.querySelectorAll(".ai-step")].map((s) => s.getAttribute("data-status") + ":" + s.textContent.replace(/\s+/g, " ").trim()).join(" | ")));
+console.log("failure box:", await p.evaluate(() => [...document.querySelectorAll(".drawer .notice")].map((n) => n.textContent.replace(/\s+/g, " ").trim()).find((t) => t.includes("上游")) || "none"));
+await b.close();

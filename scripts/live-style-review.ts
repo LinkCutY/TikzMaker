@@ -1,0 +1,32 @@
+import assert from "node:assert/strict";
+import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { resolve } from "node:path";
+import { runGeneration, compareVision } from "../server/ai.mjs";
+import { parseBody } from "../src/lib/figure/parse";
+import { buildDocument } from "../src/lib/figure/generate";
+const apiKey = (await readFile(process.env.TIKZ_AI_KEY_FILE!, "utf8")).match(/sk-[A-Za-z0-9_-]+/)?.[0];
+assert.ok(apiKey);
+const baseUrl = "https://api.deepseek.com/v1", model = "deepseek-flash";
+const image = "data:image/png;base64," + (await readFile(".probe-tests/fixtures/flowchart.png")).toString("base64");
+const dir = resolve(".probe-tests/live/stage4-style-review");
+await mkdir(dir, { recursive: true });
+let done: any;
+for await (const event of runGeneration({ mode: "image", image, apiKey, baseUrl, model, canvasMode: true, reviewer: false, budgetMs: 75000 })) {
+  if (event.type === "step") console.log(`${event.label || event.id}: ${event.status}`);
+  if (event.type === "error") throw new Error(event.message);
+  if (event.type === "done") done = event;
+}
+assert.ok(done?.ok);
+const canonical = buildDocument(parseBody(done.code));
+await writeFile(resolve(dir, "model.tex"), done.code);
+await writeFile(resolve(dir, "roundtrip.tex"), canonical);
+const good = await compareVision({ source: canonical, image, apiKey, baseUrl, model });
+console.log("flowchart visual review: " + JSON.stringify(good));
+const original = "data:image/png;base64," + (await readFile(".probe-tests/fixtures/paper-main.png")).toString("base64");
+const broken = await readFile(".probe-tests/live/stage2-bounded/merged.tex", "utf8");
+const bad = await compareVision({ source: broken, image: original, apiKey, baseUrl, model });
+console.log("known bad reconstruction review: " + JSON.stringify(bad));
+await writeFile(resolve(dir, "report.json"), JSON.stringify({ good, bad, model }, null, 2));
+assert.ok(good.ok && good.pass, "Faithful flowchart reconstruction should pass visual review");
+assert.ok(bad.ok && !bad.pass, "Known wrong peaks/layout should fail visual review");
+console.log("PASS: actual DeepSeek conversion, styled export/reopen and two-image visual acceptance/rejection.");

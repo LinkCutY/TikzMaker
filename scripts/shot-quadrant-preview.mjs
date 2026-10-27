@@ -1,0 +1,21 @@
+import puppeteer from "puppeteer-core";
+const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const browser = await puppeteer.launch({ executablePath: EDGE, headless: true, args: ["--no-sandbox", "--disable-gpu", "--hide-scrollbars"] });
+const page = await browser.newPage();
+await page.setViewport({ width: 1680, height: 1040 });
+await page.goto(process.argv[2] || "http://127.0.0.1:5188", { waitUntil: "networkidle2", timeout: 90000 });
+await page.waitForSelector(".canvas-svg", { timeout: 60000 });
+await wait(4000);
+await page.click('[title="模板库"]');
+await wait(500);
+await page.evaluate(() => [...document.querySelectorAll(".template")].find((x) => x.textContent.includes("四象限"))?.click());
+await wait(6000);
+await page.evaluate(() => [...document.querySelectorAll(".tabs-inline button")].find((b) => b.textContent.includes("预览"))?.click());
+await page.waitForSelector("img.page", { timeout: 60000 });
+await wait(1200);
+await page.screenshot({ path: ".shots/45-quadrant-preview.png" });
+// also grab the generated source
+const src = await page.evaluate(() => document.querySelector(".cm-content")?.textContent || "");
+console.log(src.split("\n").slice(6, 12).join("\n"));
+await browser.close();

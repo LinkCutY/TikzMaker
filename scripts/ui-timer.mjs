@@ -1,0 +1,35 @@
+import puppeteer from "puppeteer-core";
+const EDGE = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const b = await puppeteer.launch({ executablePath: EDGE, headless: true, args: ["--no-sandbox", "--disable-gpu"] });
+const p = await b.newPage();
+await p.setViewport({ width: 1680, height: 1040 });
+const errs = [];
+p.on("pageerror", (e) => errs.push("pageerror: " + e.message));
+await p.goto("http://127.0.0.1:5188", { waitUntil: "networkidle2", timeout: 90000 });
+await p.waitForSelector(".canvas-svg", { timeout: 60000 });
+await wait(1500);
+await p.evaluate(() => {
+  const raw = localStorage.getItem("tikz-studio:v1");
+  const st = raw ? JSON.parse(raw) : { state: {}, version: 1 };
+  st.state.settings = { ...(st.state.settings || {}), provider: "custom", apiBaseUrl: "http://127.0.0.1:8899/v1", apiKey: "mock-key", apiModel: "deepseek-flash", engine: "xelatex" };
+  localStorage.setItem("tikz-studio:v1", JSON.stringify(st));
+});
+await p.reload({ waitUntil: "networkidle2", timeout: 90000 });
+await p.waitForSelector(".canvas-svg", { timeout: 60000 });
+await wait(2200);
+await p.evaluate(() => [...document.querySelectorAll(".topbar button")].find((x) => x.textContent.includes("文生 TikZ"))?.click());
+await p.waitForSelector(".drawer textarea", { timeout: 20000 });
+await p.click(".drawer textarea");
+await p.keyboard.type("画一个示意图");
+await p.evaluate(() => [...document.querySelectorAll(".drawer button")].find((x) => x.textContent.includes("生成并校验"))?.click());
+await wait(1200);
+console.log("button while running:", await p.evaluate(() => [...document.querySelectorAll(".drawer button")].map((x) => x.textContent.trim()).find((t) => t.startsWith("生成中")) || "not found"));
+await p.waitForFunction(() => {
+  const t = document.querySelector(".card .pill")?.textContent || "";
+  return t.includes("编译通过") || t.includes("仍有编译错误");
+}, { timeout: 90000 }).catch(() => errs.push("no result"));
+await wait(400);
+console.log("meta:", await p.evaluate(() => document.querySelector(".card .hint.mono")?.textContent?.replace(/\s+/g, " ").trim()));
+console.log(errs.length ? errs.slice(0, 3).join(" | ") : "no page errors");
+await b.close();
