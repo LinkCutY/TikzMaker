@@ -25,6 +25,11 @@
     "test:residual": "node scripts/test-residual.mjs",
     "test:groundtext": "node scripts/run-ts.mjs scripts/test-groundtext.ts",
     "test:ridge": "node scripts/run-ts.mjs scripts/test-ridge.ts",
+    "test:landmarks": "node scripts/test-curve-landmarks.mjs",
+    "test:y-axis": "node scripts/run-ts.mjs scripts/test-y-axis.ts",
+    "test:relations": "node scripts/test-curve-relations.mjs",
+    "test:joint": "node scripts/test-joint-fit.mjs",
+    "test:plot-accept": "node scripts/test-plot-acceptance.mjs",
     "shot:vector": "node scripts/shot-vector.mjs",
     "shot:hybrid": "node scripts/shot-hybrid.mjs"
   },

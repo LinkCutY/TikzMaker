@@ -171,6 +171,20 @@ export function fitFamily(points, familyName, options) {
   return { family: familyName, params: fit.params, rmse: fit.rmse, ok, k: fit.params.length };
 }
 
+/** Evaluate a fitted family in the original pixel/data space. */
+export function familyValue(familyName, params, x) {
+  const family = FAMILIES[familyName];
+  if (!family) return NaN;
+  const v = family.eval(x, params || []);
+  return Number.isFinite(v) ? v : NaN;
+}
+
+/** First derivative of a fitted family by central difference. */
+export function familyDerivative(familyName, params, x) {
+  const h = 1e-3;
+  return (familyValue(familyName, params, x + h) - familyValue(familyName, params, x - h)) / (2 * h);
+}
+
 /** TikZ function expression for a fitted family. */
 export function familyExpression(familyName, params, variable) {
   const family = FAMILIES[familyName];

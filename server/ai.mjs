@@ -19,8 +19,11 @@ import { proposeRegions, drawRegion } from "./decompose.mjs";
 
 import { DIAGRAM_PROTOCOL, validateSemantic, layoutSemantic, compileSemantic } from "./semantic.mjs";
 import { measureTexts } from "./metrics.mjs";
-import { buildTicks, tickTikz } from "./axis.mjs";
+import { buildTicks, tickTikz, calibrateAxis, calibrateYFromFrame } from "./axis.mjs";
 import { acceptance, checkComplexity, provenanceOf } from "./policy.mjs";
+import { validatePlotModel, budgetSeries, selectControlPoints } from "./curve-landmarks.mjs";
+import { evaluateRelations, relationFeedback, checkContinuity, planLocalReviews } from "./curve-relations.mjs";
+import { fitJointSeries } from "./joint-fit.mjs";
 
 /** True when the class-specific structural checks passed (the reviewer is separate). */
 function clsOk(gate) {
@@ -69,14 +72,15 @@ export function mergeSparseCurveSegments(curves, options) {
   const cleanName = (c) => String(c && c.name || "").replace(/\s+/g, "").toLowerCase();
   const cleanColor = (c) => String(c && (c.color || c.style?.stroke) || "").toLowerCase();
   const cleanDash = (c) => String(c && (c.dash || c.style?.dash) || "solid").toLowerCase();
-  const bound = (points) => points.length <= 12
+  const cleanPoints = (curve) => (Array.isArray(curve && curve.points) ? curve.points : [])
+    .filter((p) => Array.isArray(p) && Number.isFinite(Number(p[0])) && Number.isFinite(Number(p[1])))
+    .map((p) => [Number(p[0]), Number(p[1])])
+    .sort((a, b) => a[0] - b[0]);
+  const bound = (points, curve) => points.length <= 12
     ? points
-    : Array.from({ length: 12 }, (_, k) => points[Math.round((k * (points.length - 1)) / 11)]);
+    : selectControlPoints(Object.assign({}, curve, { points }), opts).points;
   const prepared = (Array.isArray(curves) ? curves : []).map((curve) => Object.assign({}, curve, {
-    points: bound((Array.isArray(curve && curve.points) ? curve.points : [])
-      .filter((p) => Array.isArray(p) && Number.isFinite(Number(p[0])) && Number.isFinite(Number(p[1])))
-      .map((p) => [Number(p[0]), Number(p[1])])
-      .sort((a, b) => a[0] - b[0])),
+    points: bound(cleanPoints(curve), curve),
   })).filter((curve) => curve.points.length >= 2);
   const compatible = (a, b) => {
     if (cleanColor(a) !== cleanColor(b) || cleanDash(a) !== cleanDash(b)) return false;
@@ -1037,6 +1041,46 @@ function appendDecorations(result, model, raster, aspect) {
   return result;
 }
 
+/** Build a y-axis calibration from numeric labels sitting left of the frame (§6). */
+function calibrateYAxisFromLabels(raster, frameInfo, labels) {
+  const axisLine = findAxis(raster);
+  const frameLeft = frameInfo && frameInfo.bounds ? frameInfo.bounds.x0 : 0;
+  const numeric = (labels || []).filter((el) => el && el.kind === "text" && /^-?\d+(\.\d+)?$/.test(String(el.tex || "").replace(/\$/g, "").replace(/\u2212/g, "-").trim()));
+  const left = numeric.filter((el) => {
+    const c = elementCenter(el);
+    if (!c) return false;
+    const cx = (c[0] / 1000) * raster.w;
+    const cy = (c[1] / 1000) * raster.h;
+    // y-axis numbers sit left of the vertical axis and ABOVE the horizontal axis;
+    // the x-axis tick numbers below the axis must not be mistaken for y ticks.
+    return cx < frameLeft + 4 && (!axisLine || cy < axisLine.y - 2);
+  });
+  if (left.length < 2) {
+    // Frame fallback: the top/bottom borders anchor the same 0/1 evidence.
+    if (left.length === 1 && frameInfo && frameInfo.bounds) {
+      const only = left[0];
+      const c = elementCenter(only);
+      if (c) {
+        const value = Number(String(only.tex || "").replace(/\$/g, "").replace(/\u2212/g, "-").trim());
+        const b = frameInfo.bounds;
+        const top = b.y0, bottom = b.y1;
+        const otherValue = value === 0 ? 1 : 0;
+        const otherPy = value === 0 ? bottom : top;
+        const thisPy = (c[1] / 1000) * raster.h;
+        const cal = calibrateYFromFrame({ topPx: top, bottomPx: bottom, topValue: otherValue === 0 ? 0 : 1, bottomValue: otherValue === 1 ? 1 : 0 });
+        if (cal.ok) return { ok: true, calibration: cal, count: 2, source: "frame+label" };
+      }
+    }
+    return { ok: false, count: left.length, source: "labels" };
+  }
+  const pairs = left.map((el) => {
+    const c = elementCenter(el);
+    return { py: (c[1] / 1000) * raster.h, value: Number(String(el.tex || "").replace(/\$/g, "").replace(/\u2212/g, "-").trim()) };
+  });
+  const calibration = calibrateAxis(pairs, { pixelDirection: "y", minTicks: 2 });
+  return { ok: calibration.ok, calibration, count: left.length, source: "labels" };
+}
+
 async function* runFigureGeneration(opts) {
   const started = Date.now();
   const remaining = () => opts.budgetMs - (Date.now() - started);
@@ -1329,7 +1373,8 @@ async function* runFigureGeneration(opts) {
       }
       }
       if (Array.isArray(model.elements) && model.elements.some((el) => el && el.kind === "text")) {
-        const grounded = groundText(raster, model.elements.filter((el) => el && el.kind === "text"), {
+        const sourceTexts = model.elements.filter((el) => el && el.kind === "text");
+        const grounded = groundText(raster, sourceTexts, {
           frameLeft: frameInfo.bounds ? frameInfo.bounds.x0 : 0, frame: frameInfo, axis: findAxis(raster),
         });
         textBlockList = grounded.blocks;
@@ -1359,6 +1404,11 @@ async function* runFigureGeneration(opts) {
                 detail: ticks.ticks.length + " 个刻度 · 线性残差 " + ticks.calibration.rmse.toFixed(2) + "px" + (ticks.calibration.dropped ? " · 剔除 " + ticks.calibration.dropped : ""),
               };
             }
+          }
+          const yAxis = calibrateYAxisFromLabels(raster, frameInfo, sourceTexts);
+          if (yAxis.ok) {
+            model = Object.assign({}, model, { yAxis: { calibration: yAxis.calibration, source: yAxis.source, rmse: yAxis.calibration.rmse } });
+            yield { type: "step", id: "yaxis", label: "纵轴标定", status: "ok", detail: yAxis.count + " 个纵轴刻度 · 线性残差 " + yAxis.calibration.rmse.toFixed(2) + "px · " + yAxis.source };
           }
         } catch (err) {
           yield { type: "step", id: "axis", label: "轴标定与刻度", status: "fail", detail: String((err && err.message) || err).slice(0, 60) };
@@ -1393,8 +1443,8 @@ async function* runFigureGeneration(opts) {
     try {
       const plot = await extractPlotCurves({ image: opts.image, apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, signal: opts.signal });
       if (plot.curves.length) {
-        model = Object.assign({}, model, { curves: plot.curves, source: "model-sparse-control-points", fitted: true });
-        yield { type: "step", id: "curves", label: "独立稀疏曲线识别", status: "ok", detail: plot.curves.length + " 条 · 每条最多 12 个关键点" };
+        model = Object.assign({}, model, { curves: plot.curves, relations: plot.relations || [], source: "model-sparse-control-points", fitted: true });
+        yield { type: "step", id: "curves", label: "独立稀疏曲线识别", status: "ok", detail: plot.curves.length + " 条 · 关系 " + (plot.relations || []).length + " 条 · 每条最多 12 个关键点" };
       }
     } catch (err) {
       yield { type: "step", id: "curves", label: "独立稀疏曲线识别", status: "fail", detail: String((err && err.message) || err).slice(0, 60) };
@@ -1403,13 +1453,24 @@ async function* runFigureGeneration(opts) {
   if (Array.isArray(model.curves) && model.curves.length) {
     const beforeMerge = model.curves.length;
     const mergedCurves = mergeSparseCurveSegments(model.curves);
+    const budgeted = budgetSeries(mergedCurves, { budget: 12 });
     model = Object.assign({}, model, {
-      curves: mergedCurves,
+      curves: budgeted,
       source: model.source || "model-sparse-control-points",
       fitted: true,
     });
     if (mergedCurves.length < beforeMerge) {
       yield { type: "step", id: "mergecurves", label: "合并同一曲线的稀疏分段", status: "ok", detail: beforeMerge + " 段 → " + mergedCurves.length + " 条曲线" };
+    }
+    // §7: candidate models are selected JOINTLY against the relation evidence.
+    if (Array.isArray(model.relations) && model.relations.length) {
+      try {
+        const joint = fitJointSeries(model.curves, model.relations, { yCalibration: model.yAxis && model.yAxis.calibration });
+        model = Object.assign({}, model, { joint });
+        yield { type: "step", id: "jointfit", label: "联合约束拟合", status: joint.ok ? "ok" : "fail", detail: "拟合 " + joint.terms.fit.toFixed(1) + " · 次序 " + joint.terms.order.toFixed(1) + " · 轴接触 " + joint.terms.axis.toFixed(1) + (joint.relation && joint.relation.failures.length ? " · " + joint.relation.failures.length + " 个关系失败" : "") };
+      } catch (err) {
+        yield { type: "step", id: "jointfit", label: "联合约束拟合", status: "fail", detail: String((err && err.message) || err).slice(0, 60) };
+      }
     }
   }
   // §10.2: build ATOMIC legend entries from the detected samples, bind them to the
@@ -1461,7 +1522,7 @@ async function* runFigureGeneration(opts) {
           return tex ? Object.assign({}, entry, { tex, mode: "math", confidence: Math.min(entry.confidence || 0.8, 0.9) }) : entry;
         });
         const problems = validateLegend(bound, { series });
-        const usable = bound.filter((e) => e.seriesId && String(e.tex || "").trim()).map((entry) => ({
+        let usable = bound.filter((e) => e.seriesId && String(e.tex || "").trim()).map((entry) => ({
           ...entry,
           baseline: (Number(entry.baseline) / raster.h) * 1000,
           sample: entry.sample ? {
@@ -1472,6 +1533,15 @@ async function* runFigureGeneration(opts) {
             y1: (Number(entry.sample.y1) / raster.h) * 1000,
           } : null,
         }));
+        // One series owns exactly one legend entry; duplicated samples of the same
+        // curve must not emit two swatches and two labels.
+        const bySeries = new Map();
+        for (const entry of usable) {
+          if (!entry.seriesId) continue;
+          const prev = bySeries.get(entry.seriesId);
+          if (!prev || (Number(entry.confidence) || 0) > (Number(prev.confidence) || 0)) bySeries.set(entry.seriesId, entry);
+        }
+        usable = [...bySeries.values()];
         if (usable.length) {
           const legendKey = (value) => String(value || "")
             .replace(/\\gamma/g, "γ").replace(/\\Gamma/g, "Γ")
@@ -1627,7 +1697,7 @@ async function* runFigureGeneration(opts) {
     yield { type: "step", id: "compile", status: compiled.ok ? "ok" : "fail", detail: compiled.ok ? undefined : compiled.errors.length + " 个错误" };
     lastCompiled = compiled;
     if (!compiled.ok) {
-      best = { code, compiled, stats, visual: null, geometry: null, evidence: acceptanceEvidence(model, code) };
+      best = { code, compiled, stats, visual: null, geometry: null, evidence: acceptanceEvidence(model, code), model };
       compileFeedback = "A previous answer produced a document that failed to compile: " + (compiled.errors || []).map((e) => e.message).join("; ").slice(0, 200) + ". Fix the LaTeX, keep the geometry identical.";
       if (attempt + 1 < maxRounds && remaining() > 60_000) continue;
       break;
@@ -1651,6 +1721,19 @@ async function* runFigureGeneration(opts) {
             problems.push("曲线#" + i + " 整体偏移约 (" + off.dx.toFixed(0) + ", " + off.dy.toFixed(0) + ") 像素，请按这个方向移动控制点");
           }
         });
+        // §8: structural relations are a hard gate, independent of the soft
+        // whole-image ink coverage.
+        if (Array.isArray(model.relations) && model.relations.length) {
+          const relationResult = evaluateRelations({
+            series: model.curves || [],
+            relations: model.relations,
+            yCalibration: model.yAxis && model.yAxis.calibration,
+            options: { defaultMarginPx: 6 },
+          });
+          for (const failure of relationResult.failures) problems.unshift(failure.message);
+          for (const curve of (model.curves || [])) for (const gap of checkContinuity(curve).gaps) problems.push("曲线存在可疑断点：x 间距比例 " + gap.ratio.toFixed(2));
+          model = Object.assign({}, model, { relationResult, localReviews: planLocalReviews(model.curves, model.relations, {}) });
+        }
       }
       if (compiled.png) {
         const ink = compareInk(raster, compiled.png);
@@ -1682,7 +1765,7 @@ async function* runFigureGeneration(opts) {
     }
     const current = versions[versions.length - 1];
     if (current) current.score = visual && typeof visual.score === "number" ? visual.score : null;
-    const candidate = { code, compiled, stats, visual, geometry: { recall, precision, minCell, problems }, evidence: acceptanceEvidence(model, code) };
+    const candidate = { code, compiled, stats, visual, geometry: { recall, precision, minCell, problems }, evidence: acceptanceEvidence(model, code), model };
     const scoreOf = (c) => (c.visual && typeof c.visual.score === "number" ? c.visual.score : -1) * 1000 + (c.geometry && typeof c.geometry.recall === "number" ? c.geometry.recall : 0);
     if (!best || scoreOf(candidate) > scoreOf(best)) best = candidate;
     if (visual && visual.pass) break;
@@ -1794,12 +1877,14 @@ async function* runFigureGeneration(opts) {
   }
   const logId = await logAttempt({ code: final.code || "", mode: "image-figure", perPanel: opts.perPanel, panelIndex: opts.panelIndex, attempt: 1, model: opts.model, compile: final.compiled, durationMs: Date.now() - started });
   if (logId) yield { type: "log", logId };
+  const reportModel = final && final.model ? final.model : model;
   const recall = final.geometry && typeof final.geometry.recall === "number" ? final.geometry.recall : null;
   const visualOk = !final.visual || final.visual.pass !== false;
+  const relationOk = !reportModel.relationResult || reportModel.relationResult.ok;
   // §7: the visual score alone must not decide. A document that covers almost none
   // of the source ink is a failure even if the reviewer likes it, and an empty
   // document cannot pass on its text alone.
-  const evidence = final.evidence || acceptanceEvidence(model, final.code);
+  const evidence = final.evidence || acceptanceEvidence(reportModel, final.code);
   const gate = acceptance({
     figureClass: evidence.figureClass,
     recall,
@@ -1811,7 +1896,10 @@ async function* runFigureGeneration(opts) {
     pass: final.visual ? final.visual.pass : undefined,
   });
   const geometryOk = clsOk(gate);
-  const ok = Boolean(final.compiled && final.compiled.ok) && gate.ok;
+  const ok = Boolean(final.compiled && final.compiled.ok) && gate.ok && relationOk;
+  if (Boolean(final.compiled && final.compiled.ok) && !relationOk) {
+    yield { type: "step", id: "relations", label: "结构关系门禁", status: "fail", detail: relationFeedback(reportModel.relationResult) };
+  }
   if (Boolean(final.compiled && final.compiled.ok) && !gate.ok && visualOk) {
     yield { type: "step", id: "accept", label: "验收闸门", status: "fail", detail: gate.reasons.join(" · ") };
   }
@@ -1821,7 +1909,7 @@ async function* runFigureGeneration(opts) {
   yield {
     type: "done", ok, code: final.code,
     errors: (final.compiled && final.compiled.errors) || [],
-    reason: ok ? undefined : (!visualOk ? "REVIEW_REJECTED" : (!geometryOk ? "GEOMETRY_REJECTED" : "COMPILE_FAILED")),
+    reason: ok ? undefined : (!relationOk ? "RELATION_REJECTED" : (!visualOk ? "REVIEW_REJECTED" : (!geometryOk ? "GEOMETRY_REJECTED" : "COMPILE_FAILED"))),
     model: opts.model, attempts: 0, rounds: Math.max(1, lastAttempt + 1), representation: "figure", provenance,
     versions,
     search: { candidates: versions.length, explore: versions.filter((v) => v.kind === "explore").length, bestRound: versions.length ? versions.slice().sort((a, b) => ((b.score ?? -1) - (a.score ?? -1)))[0].round : null },
@@ -1829,6 +1917,11 @@ async function* runFigureGeneration(opts) {
     understanding: { type: final.stats ? final.stats.type : "other", summary: final.stats ? final.stats.summary : "", items: built.items, kinds: final.stats ? final.stats.kinds : {}, elements: final.stats ? final.stats.elements : 0 },
     trace: final.stats,
     visual: final.visual ? { score: final.visual.score, pass: final.visual.pass, issues: final.visual.issues } : null,
+    curves: (reportModel && reportModel.curves || []).map((c) => ({ id: c.id, name: c.name, points: Array.isArray(c.points) ? c.points.length : 0, landmarks: Array.isArray(c.landmarks) ? c.landmarks.length : 0, preservedKinds: c.preservedKinds || [], dropped: c.dropped || 0, candidate: c.candidate ? { kind: c.candidate.kind, family: c.candidate.family, k: c.candidate.k, rmse: c.candidate.rmse } : null })),
+    relations: reportModel && reportModel.relationResult ? { ok: reportModel.relationResult.ok, failures: reportModel.relationResult.failures, checks: reportModel.relationResult.checks, space: reportModel.relationResult.space } : null,
+    yAxis: reportModel && reportModel.yAxis ? { ok: true, rmse: reportModel.yAxis.rmse, source: reportModel.yAxis.source } : null,
+    joint: reportModel && reportModel.joint ? { ok: reportModel.joint.ok, loss: reportModel.joint.loss, terms: reportModel.joint.terms, assignment: reportModel.joint.assignment, relation: reportModel.joint.relation ? { ok: reportModel.joint.relation.ok, failures: reportModel.joint.relation.failures } : null } : null,
+    localReviews: reportModel && Array.isArray(reportModel.localReviews) ? reportModel.localReviews.length : 0,
     durationMs: Date.now() - started,
   };
   yield { type: "end" };
@@ -1911,6 +2004,11 @@ async function* runGenerationInner(opts) {
     model: opts.model, attempts: attempt, rounds: attempt, representation: opts.representation || "native",
     versions, geometry: null,
     visual: final.visual ? { score: final.visual.score, pass: final.visual.pass, issues: final.visual.issues } : null,
+    curves: (reportModel && reportModel.curves || []).map((c) => ({ id: c.id, name: c.name, points: Array.isArray(c.points) ? c.points.length : 0, landmarks: Array.isArray(c.landmarks) ? c.landmarks.length : 0, preservedKinds: c.preservedKinds || [], dropped: c.dropped || 0, candidate: c.candidate ? { kind: c.candidate.kind, family: c.candidate.family, k: c.candidate.k, rmse: c.candidate.rmse } : null })),
+    relations: reportModel && reportModel.relationResult ? { ok: reportModel.relationResult.ok, failures: reportModel.relationResult.failures, checks: reportModel.relationResult.checks, space: reportModel.relationResult.space } : null,
+    yAxis: reportModel && reportModel.yAxis ? { ok: true, rmse: reportModel.yAxis.rmse, source: reportModel.yAxis.source } : null,
+    joint: reportModel && reportModel.joint ? { ok: reportModel.joint.ok, loss: reportModel.joint.loss, terms: reportModel.joint.terms, assignment: reportModel.joint.assignment, relation: reportModel.joint.relation ? { ok: reportModel.joint.relation.ok, failures: reportModel.joint.relation.failures } : null } : null,
+    localReviews: reportModel && Array.isArray(reportModel.localReviews) ? reportModel.localReviews.length : 0,
     durationMs: Date.now() - started,
   };
   yield { type: "end" };
@@ -2056,28 +2154,37 @@ export async function recognizeLabels({ image, apiKey, baseUrl, model, signal })
 }
 
 const PLOT_CURVES_PROMPT = [
-  "This image is a line plot. Extract the curves as control points. Do not write TikZ and do not describe the figure.",
-  'Return ONLY JSON: {"curves":[{"name":"legend text or empty","color":"#rrggbb","width":2,"dash":"solid|dashed|dotted","continuous":true,"points":[[x,y],[x,y],[x,y],[x,y]]}]}',
+  "This image is a line plot. Extract the curves as sparse semantic control points plus landmarks and cross-curve relations. Do not write TikZ and do not describe the figure.",
+  'Return ONLY JSON: {"curves":[{"id":"curve-1","name":"legend text or empty","color":"#rrggbb","width":2,"dash":"solid|dashed|dotted","continuous":true,"points":[[x,y],[x,y],[x,y],[x,y]],"landmarks":[{"kind":"left-end|right-end|minimum|maximum|crossing|platform-edge|inflection","point":[x,y],"confidence":0.9,"with":"curve-2"}]}],"relations":[{"kind":"vertical-order","at":{"kind":"minimum","seriesId":"curve-2"},"aboveSeriesId":"curve-1","belowSeriesId":"curve-2","marginPx":8,"confidence":0.9}]}',
   "Rules:",
-  "- One entry per visible curve, in the order they appear from the bottom of the plot to the top.",
+  "- One entry per visible curve, in the order they appear from the bottom of the plot to the top. Give every curve a stable id and refer to ids in landmarks/relations, never array positions or label text.",
   "- 6 to 12 points per curve, each lying ON that curve, x strictly increasing.",
+  "- Put AT LEAST THREE points inside every peak/dip (left shoulder, extremum, right shoulder).",
+  "- Mark high-confidence endpoints, local minima/maxima, crossings, plateau edges and inflections as landmarks; include confidence and reuse the exact id of the other curve for crossings.",
+  "- Only add a relation when the image clearly shows it. vertical-order means the below series is lower in data space at the extremum; axis-contact means a curve extremum reaches an axis value.",
   "- Set continuous=true unless the printed curve visibly has a real mathematical discontinuity or gap; a steep peak or dip is still continuous.",
-  "- Put AT LEAST THREE points inside the peak region (both shoulders and the apex), so the peak is a curve rather than a triangle.",
-  "- Coordinates are normalised 0..1000 over the WHOLE image, origin top-left, x right, y down.",
+  "- Coordinates are normalised 0..1000 over the WHOLE image, origin top-left, x right, y DOWN.",
+  "- IMPORTANT: because y grows downward, the data value 0 is near the BOTTOM of the frame and larger values are near the TOP. Do not flip the y axis when placing V(z), gamma(z) or the y ticks.",
+  "- In vertical-order, the below series has the LARGER y coordinate (it sits lower in the image) at the referenced extremum.",
   "- width is the stroke width in SOURCE PIXELS; use dash=dashed or dotted only when the curve really is.",
   "- Do not include the axes, ticks, frames, any text or legend swatches.",
 ].join("\n");
 
-/** Secondary pass for plots: curves as a few control points each. */
+/** Secondary pass for plots: curves as sparse points plus landmarks/relations. */
 export async function extractPlotCurves({ image, apiKey, baseUrl, model, signal, feedback }) {
   const text = PLOT_CURVES_PROMPT + (feedback ? "\n\nA previous attempt was rejected:\n" + String(feedback).slice(0, 600) : "");
   const out = await chat({
-    apiKey, baseUrl, model, signal, temperature: 0, thinking: "disabled", maxTokens: 4000, timeoutMs: 90_000,
+    apiKey, baseUrl, model, signal, temperature: 0, thinking: "disabled", maxTokens: 5000, timeoutMs: 90_000,
     messages: [{ role: "user", content: [{ type: "text", text }, { type: "image_url", image_url: { url: gridImage(image) } }] }],
   });
   const json = parseJsonObject(out.text);
   const curves = (Array.isArray(json.curves) ? json.curves : []).filter((c) => c && Array.isArray(c.points) && c.points.length >= 2);
-  return { curves, usage: out.usage };
+  const relations = Array.isArray(json.relations) ? json.relations : [];
+  const validation = validatePlotModel({ curves, relations }, { strict: false });
+  if (validation.errors.length) {
+    throw new Error("曲线协议错误：" + validation.errors.slice(0, 3).join("; "));
+  }
+  return { curves, relations, usage: out.usage, warnings: validation.warnings };
 }
 
 /** Ask for the SEMANTIC structure of a diagram (nodes / edges / labels). */

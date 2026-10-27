@@ -7,25 +7,36 @@
  */
 
 /** Robust linear fit value = a + b * pixel, rejecting gross outliers. */
-export function calibrate(pairs, options) {
+/** Core one-dimensional linear calibration shared by the x- and y-axes (§6). */
+export function calibrateAxis(pairs, options) {
   const opts = options || {};
-  const pts = (pairs || []).filter((p) => Number.isFinite(p.px) && Number.isFinite(p.value));
-  if (pts.length < 2) return { ok: false, reason: "need at least two readable ticks", ticks: pts };
+  const direction = opts.pixelDirection === "y" ? "y" : "x";
+  const key = direction === "y" ? "py" : "px";
+  const raw = (pairs || []).map((p) => {
+    if (Array.isArray(p)) {
+      return direction === "y" ? { coord: Number(p[1]), value: Number(p[0]), py: Number(p[1]) } : { coord: Number(p[0]), value: Number(p[1]), px: Number(p[0]) };
+    }
+    const coord = Number(p[key]);
+    const value = Number(p.value);
+    return { coord, value, py: Number.isFinite(p.py) ? p.py : coord, px: Number.isFinite(p.px) ? p.px : coord };
+  }).filter((p) => Number.isFinite(p.coord) && Number.isFinite(p.value));
+  if (raw.length < Math.max(2, opts.minTicks || 2)) return { ok: false, reason: "need at least two readable ticks", ticks: raw, direction };
+  const pts = raw;
   const mean = (a) => a.reduce((s, v) => s + v, 0) / a.length;
   const fit = (list) => {
-    const mx = mean(list.map((p) => p.px));
-    const my = mean(list.map((p) => p.value));
-    let sxx = 0, sxy = 0;
-    for (const p of list) { sxx += (p.px - mx) ** 2; sxy += (p.px - mx) * (p.value - my); }
-    if (Math.abs(sxx) < 1e-9) return null;
-    const b = sxy / sxx;
-    return { a: my - b * mx, b };
+    const mc = mean(list.map((p) => p.coord));
+    const mv = mean(list.map((p) => p.value));
+    let scc = 0, scv = 0;
+    for (const p of list) { scc += (p.coord - mc) ** 2; scv += (p.coord - mc) * (p.value - mv); }
+    if (Math.abs(scc) < 1e-9) return null;
+    const b = scv / scc;
+    return { a: mv - b * mc, b };
   };
   let model = fit(pts);
-  if (!model) return { ok: false, reason: "all ticks share one position", ticks: pts };
+  if (!model) return { ok: false, reason: "all ticks share one position", ticks: pts, direction };
   let kept = pts;
   for (let pass = 0; pass < 2; pass++) {
-    const residuals = pts.map((p) => ({ p, r: Math.abs(model.a + model.b * p.px - p.value) }));
+    const residuals = pts.map((p) => ({ p, r: Math.abs(model.a + model.b * p.coord - p.value) }));
     const scale = Math.max(1e-9, residuals.map((x) => x.r).sort((x, y) => x - y)[Math.floor(residuals.length / 2)] || 0);
     const limit = Math.max((opts.minTolerance || 1) * scale, opts.absTolerance == null ? 0.05 : opts.absTolerance);
     const next = residuals.filter((x) => x.r <= limit).map((x) => x.p);
@@ -36,14 +47,39 @@ export function calibrate(pairs, options) {
     model = again;
   }
   let sse = 0;
-  for (const p of kept) sse += (model.a + model.b * p.px - p.value) ** 2;
+  for (const p of kept) sse += (model.a + model.b * p.coord - p.value) ** 2;
+  const toValue = (coord) => model.a + model.b * coord;
+  const toPixel = (value) => (value - model.a) / model.b;
   return {
-    ok: true, a: model.a, b: model.b,
+    ok: true, a: model.a, b: model.b, direction,
     rmse: Math.sqrt(sse / kept.length),
     ticks: pts, inliers: kept.length, dropped: pts.length - kept.length,
-    toValue: (px) => model.a + model.b * px,
-    toPixel: (value) => (value - model.a) / model.b,
+    toValue, toPixel,
+    // Explicit aliases that read naturally for the y-axis too.
+    pixelToValue: toValue, valueToPixel: toPixel,
   };
+}
+
+/** Backward-compatible x-axis wrapper over `calibrateAxis`. */
+export function calibrate(pairs, options) {
+  const result = calibrateAxis(pairs, Object.assign({}, options || {}, { pixelDirection: "x" }));
+  return result;
+}
+
+/**
+ * Fallback y-axis calibration from two frame edges (§6): top/bottom borders
+ * become the two tick positions. Records that the evidence came from the frame.
+ */
+export function calibrateYFromFrame({ topPx, bottomPx, topValue, bottomValue, rmse = 0.5 }) {
+  if (!Number.isFinite(topPx) || !Number.isFinite(bottomPx) || topPx === bottomPx) {
+    return { ok: false, reason: "invalid frame positions" };
+  }
+  const pts = [
+    { py: topPx, value: topValue, source: "frame-top" },
+    { py: bottomPx, value: bottomValue, source: "frame-bottom" },
+  ];
+  const cal = calibrateAxis(pts, { pixelDirection: "y" });
+  return Object.assign({}, cal, { ok: cal.ok, evidence: "frame" });
 }
 
 /** Tick objects: value, axis position, the tick stroke and the label position. */

@@ -30,7 +30,7 @@ import { readFile, readdir } from "node:fs/promises";
 
 console.log("no-tracing source scan");
 // The image pipeline must not import or call the tracing primitives.
-const PIPELINE = ["ai.mjs", "index.mjs", "decompose.mjs", "primitives.mjs", "semantic.mjs", "metrics.mjs", "policy.mjs"];
+const PIPELINE = ["ai.mjs", "index.mjs", "decompose.mjs", "primitives.mjs", "semantic.mjs", "metrics.mjs", "policy.mjs", "curve-landmarks.mjs", "curve-relations.mjs", "joint-fit.mjs", "axis.mjs", "family.mjs", "spline.mjs"];
 const FORBIDDEN = ["digitizePlot", "plotResidual", "fitFigure", "traceRaster", "traceDocument", "skeletonize", "traceSkeleton", "coloredCurves"];
 const files = await readdir("server");
 const problems = [];
