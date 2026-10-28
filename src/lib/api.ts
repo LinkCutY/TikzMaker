@@ -70,7 +70,7 @@ export interface AiStreamEvent {
   instructions?: string;
   stats?: Record<string, unknown>;
   /** Why the run stopped without a result. */
-  reason?: "TIMEOUT" | "REVIEW_REJECTED" | "COMPILE_FAILED" | "GEOMETRY_REJECTED" | "STUCK";
+  reason?: "TIMEOUT" | "TIME_BUDGET" | "REVIEW_REJECTED" | "REVIEW_UNAVAILABLE" | "COMPILE_FAILED" | "GEOMETRY_REJECTED" | "SCENE_REJECTED" | "APPROXIMATION_REQUIRED" | "STUCK";
   stuck?: boolean;
   /** The last reply hit the output limit (figure was cut off). */
   truncated?: boolean;

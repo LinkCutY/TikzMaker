@@ -8,6 +8,10 @@ coverage/
 *.log
 .DS_Store
 logs/
+# Stray artifacts kept out of version control:
+# an unexpanded %SystemDrive% path (Chrome cache) and throwaway CSS/grid labs.
+%SystemDrive%/
+.tmp-*/
 .env
 .env.*
 !.env.example

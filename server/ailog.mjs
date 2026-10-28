@@ -31,6 +31,7 @@ export async function logAttempt(entry) {
   const code = String(entry.code || "");
   try {
     await writeFile(join(DIR, id + ".tex"), code, "utf8");
+    if(entry.reconstruction) await writeFile(join(DIR,id+'.model.json'),JSON.stringify(entry.reconstruction,null,2),'utf8');
     const meta = {
       id,
       at: new Date().toISOString(),

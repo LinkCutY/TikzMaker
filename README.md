@@ -26,7 +26,7 @@ TikZ Studio 是一个面向论文插图的本地 TikZ 工作台，提供源码�
 
 - 图片必须转换为语义对象或拟合参数；
 - `trace`、`outline`、`skeleton`、`vectorize` 等描摹表示会被 API 以 `422 TRACING_DISABLED` 拒绝；
-- 曲线控制点预算不随图片分辨率增长，单条曲线最多保留 12 个语义控制点；
+- 平滑曲线最多保留 12 个语义控制点；离散观测点有独立的 80 点上限，超限会要求拆分图片，不会静默删点；
 - 不允许用大量微小线段、轮廓多边形或残差图形伪装成“可编辑重建”。
 
 这意味着一张 4000 px 的截图不会比 400 px 的截图生成更多坐标点。复杂度由图中对象的数量决定，而不是由像素数量决定。
@@ -57,6 +57,8 @@ $$
 其中基线、幅度、中心、尺度和形状参数由稀疏地标拟合。没有合适参数族时，才使用带复杂度惩罚的低自由度样条。坐标统一在裁切面板的归一化空间中处理，再映射到 TikZ 画布。
 
 图例作为“线型样本 + 文本 + 对应数据序列”的原子对象生成，避免主曲线、图例线段和 OCR 文本互相重复。最新的跨曲线相对位置、极值和坐标标定方案在 [NEXT.md](NEXT.md) 中给出。
+
+数据序列显式区分离散/连续、`linear / step / none / smooth` 连接方式和标记样式。折线保留原始顶点，用直线段连接；带标记的散点只输出标记。模型识别出的彩色实心圆标记可用有限圆对象的矩拟合核对圆心、半径和数量，不进行曲线轮廓描摹。拟合、TikZ、画布和结构验收共用同一份几何；评审修复会替换完整序列及其关系。文字框使用具名边界协议，并分别保留横轴、纵轴出现的同一个数字。
 
 ## 快速开始
 
@@ -146,6 +148,10 @@ node scripts/test-api-policy.mjs
 node scripts/test-plot-workflow.mjs
 node scripts/test-output-integration.mjs
 node scripts/run-ts.mjs scripts/test-ui-bridge.ts
+node scripts/test-series-geometry.mjs
+node scripts/test-plot-revision.mjs
+node scripts/test-plot-observations.mjs
+node scripts/run-ts.mjs scripts/test-series-roundtrip.ts
 
 # 更多确定性测试示例
 npm run test:roundtrip
@@ -230,6 +236,7 @@ tools/                  OCR / 数学 OCR 辅助脚本
 
 ## 开发文档
 
+- [CURVE_POINT_BUDGET.md](CURVE_POINT_BUDGET.md)：曲线自适应点数公式、结构点判定和可调参数；
 - [NEXT.md](NEXT.md)：下一阶段实施规范，重点是极值、相对位置、联合约束和真实模型验收；
 - [ROADMAP_REVIEW_2026-10-26.md](ROADMAP_REVIEW_2026-10-26.md)：阶段性路线审查；
 - [NO_TRACING_REBUILD_PLAN.md](NO_TRACING_REBUILD_PLAN.md)：禁止描摹的底层重建设计；

@@ -32,28 +32,29 @@ export function calibrateAxis(pairs, options) {
     const b = scv / scc;
     return { a: mv - b * mc, b };
   };
-  let model = fit(pts);
-  if (!model) return { ok: false, reason: "all ticks share one position", ticks: pts, direction };
-  let kept = pts;
-  for (let pass = 0; pass < 2; pass++) {
-    const residuals = pts.map((p) => ({ p, r: Math.abs(model.a + model.b * p.coord - p.value) }));
-    const scale = Math.max(1e-9, residuals.map((x) => x.r).sort((x, y) => x - y)[Math.floor(residuals.length / 2)] || 0);
-    const limit = Math.max((opts.minTolerance || 1) * scale, opts.absTolerance == null ? 0.05 : opts.absTolerance);
-    const next = residuals.filter((x) => x.r <= limit).map((x) => x.p);
-    if (next.length < 2 || next.length === kept.length) { kept = next.length >= 2 ? next : kept; break; }
-    kept = next;
-    const again = fit(kept);
-    if (!again) break;
-    model = again;
+  // Deterministic pair consensus prevents a single misread number from dragging
+  // least squares far enough to reject the real ticks. Never project rejected
+  // numbers back onto the axis and emit them as if they were observations.
+  let best = null;
+  for (let i=0;i<pts.length;i++) for(let j=i+1;j<pts.length;j++) {
+    const m=fit([pts[i],pts[j]]);
+    if (!m || Math.abs(m.b)<1e-12) continue;
+    const tolerance=Math.max(opts.absTolerance ?? 0.05,Math.abs(m.b)*(opts.pixelTolerance ?? 2));
+    const inliers=pts.filter(p=>Math.abs(m.a+m.b*p.coord-p.value)<=tolerance);
+    const error=inliers.reduce((sum,p)=>sum+(m.a+m.b*p.coord-p.value)**2,0);
+    if (!best || inliers.length>best.kept.length || (inliers.length===best.kept.length && error<best.error)) best={model:m,kept:inliers,error};
   }
+  if (!best) return {ok:false,reason:'ticks do not determine a nonzero scale',ticks:pts,direction};
+  const kept = best.kept;
+  const model = fit(kept);
   let sse = 0;
   for (const p of kept) sse += (model.a + model.b * p.coord - p.value) ** 2;
   const toValue = (coord) => model.a + model.b * coord;
   const toPixel = (value) => (value - model.a) / model.b;
   return {
     ok: true, a: model.a, b: model.b, direction,
-    rmse: Math.sqrt(sse / kept.length),
-    ticks: pts, inliers: kept.length, dropped: pts.length - kept.length,
+    rmse: Math.sqrt(sse / kept.length), rmsePx: Math.sqrt(sse / kept.length) / Math.abs(model.b),
+    ticks: kept, rejected:pts.filter(p=>!kept.includes(p)), inliers: kept.length, dropped: pts.length - kept.length,
     toValue, toPixel,
     // Explicit aliases that read naturally for the y-axis too.
     pixelToValue: toValue, valueToPixel: toPixel,
@@ -88,12 +89,13 @@ export function buildTicks(pairs, axis, options) {
   const calib = calibrate(pairs, opts);
   if (!calib.ok) return { ok: false, reason: calib.reason, ticks: [] };
   const lengthPx = opts.tickLengthPx == null ? 5 : opts.tickLengthPx;
-  const ticks = calib.ticks.map((p) => ({
-    value: Math.round(calib.toValue(p.px) * 1e6) / 1e6,
+  const unique = calib.ticks.filter((p,i,all)=>!all.slice(0,i).some(q=>q.value===p.value && Math.abs(q.px-p.px)<3));
+  const ticks = unique.map((p) => ({
+    value: p.value,
     px: p.px,
     py: axis ? axis.y : p.py,
     stroke: axis ? { x1: p.px, y1: axis.y - lengthPx, x2: p.px, y2: axis.y + lengthPx } : null,
-    label: { value: calib.toValue(p.px), px: p.px, py: axis ? axis.y + lengthPx * 3 : p.py + 12 },
+    label: { value: p.value, px: p.px, py: axis ? axis.y + lengthPx * 3 : p.py + 12 },
   }));
   return { ok: true, calibration: calib, ticks };
 }
@@ -108,8 +110,12 @@ export function tickTikz(ticks, geometry) {
   const X = (px) => (px / widthPx) * widthCm;
   const Y = (py) => heightCm - (py / heightPx) * heightCm;
   const out = [];
+  const seen = new Set();
   for (const t of ticks || []) {
     if (!t.stroke) continue;
+    const key=[t.stroke.x1,t.stroke.y1,t.stroke.x2,t.stroke.y2].map(n=>Math.round(n*100)/100).join(',');
+    if(seen.has(key)) continue;
+    seen.add(key);
     out.push("  \\draw[line width=0.6pt] (" + X(t.stroke.x1).toFixed(3) + "," + Y(t.stroke.y1).toFixed(3) + ") -- (" + X(t.stroke.x2).toFixed(3) + "," + Y(t.stroke.y2).toFixed(3) + ");");
   }
   return out.join("\n");

@@ -203,6 +203,9 @@ export function parseBody(body: string, options?: { pictureOptions?: string }): 
         rounded: /rounded corners/.test(opts) ? 0.15 : 0,
         fontSize: Number(/\\fontsize\{([\d.]+)\}/.exec(opts)?.[1]) || pictureFont || (/\\Large\b/.test(opts) ? 14.4 : /\\large\b/.test(opts) ? 12 : /\\scriptsize\b/.test(opts) ? 7 : /\\footnotesize\b/.test(opts) ? 8 : /\\small\b/.test(opts) ? 9 : 10),
         anchor: (/anchor\s*=\s*(north west|north east|south west|south east|west|east|north|south|center)/.exec(opts)?.[1] || "center") as NodeEl["anchor"],
+        rotate: Number(/rotate\s*=\s*(-?[\d.]+)/.exec(opts)?.[1]) || 0,
+        fontFamily: /\\sffamily\b/.test(opts) ? 'sans' : 'serif',
+        bold: /\\bfseries\b/.test(opts),
       };
       if (nodeName) {
         const chars = Math.max(1, (text || "").replace(/\\[a-zA-Z]+/g, "").replace(/[{}]/g, "").length);
@@ -383,7 +386,7 @@ export function parseBody(body: string, options?: { pictureOptions?: string }): 
           points,
           start,
           path,
-          closed: false,
+          closed: /--\s*cycle\s*$/.test(core),
           style,
         };
         elements.push(el);

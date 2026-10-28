@@ -30,9 +30,10 @@ import { readFile, readdir } from "node:fs/promises";
 
 console.log("no-tracing source scan");
 // The image pipeline must not import or call the tracing primitives.
-const PIPELINE = ["ai.mjs", "index.mjs", "decompose.mjs", "primitives.mjs", "semantic.mjs", "metrics.mjs", "policy.mjs", "curve-landmarks.mjs", "curve-relations.mjs", "joint-fit.mjs", "axis.mjs", "family.mjs", "spline.mjs"];
+const PIPELINE = ["ai.mjs", "index.mjs", "decompose.mjs", "primitives.mjs", "semantic.mjs", "metrics.mjs", "policy.mjs", "curve-landmarks.mjs", "curve-relations.mjs", "joint-fit.mjs", "axis.mjs", "family.mjs", "spline.mjs", "series-geometry.mjs", "plot-observations.mjs", "analytic-image-fit.mjs"];
 const FORBIDDEN = ["digitizePlot", "plotResidual", "fitFigure", "traceRaster", "traceDocument", "skeletonize", "traceSkeleton", "coloredCurves"];
 const files = await readdir("server");
+PIPELINE.push('scene.mjs','scene-workflow.mjs','scene-fit.mjs','scene-panels.mjs');
 const problems = [];
 for (const name of PIPELINE) {
   if (!files.includes(name)) { problems.push("missing " + name); continue; }

@@ -1,0 +1,52 @@
+import assert from 'node:assert/strict';
+import { preparePlotModel, applyPlotRevision, candidateRank, calibratePlotAxes, normalizeRecognizedLabels } from '../server/ai.mjs';
+import { primitivesToTikz } from '../server/primitives.mjs';
+import { evaluateGeometry } from '../server/series-geometry.mjs';
+import { buildTicks, tickTikz } from '../server/axis.mjs';
+import { pruneUnsupported } from '../server/verify.mjs';
+
+const raster={w:400,h:400,rgb:new Uint8Array(400*400*3).fill(255)};
+for(let x=50;x<370;x++) for(let ch=0;ch<3;ch++) raster.rgb[(320*400+x)*3+ch]=0;
+const label=(tex,x,y)=>({kind:'text',tex,box:[x-10,y-15,20,30]});
+const texts=[label('0',155,860),label('2',280,860),label('4',405,860),label('1',80,280),label('0',80,450),label('-1',80,620)];
+const points=Array.from({length:11},(_,i)=>[155+i*63,i%2?620+i*5:280-i*5]);
+const series={id:'data',dataKind:'discrete',connection:'linear',expectedPointCount:11,color:'#ee3025',points,marker:{shape:'circle',radiusPx:7}};
+const reference={id:'ref',role:'reference',connection:'linear',color:'#cccccc',dash:'dashed',points:[[155,450],[785,450]],marker:{shape:'none'}};
+const original={type:'plot',elements:[{kind:'polyline',role:'axis',points:[[125,100],[125,800],[925,800]]},
+  {kind:'line',role:'reference',x1:155,y1:450,x2:785,y2:450,style:{stroke:'#cccccc'}},...texts],curves:[series,reference],relations:[]};
+const calibrated=calibratePlotAxes(original,raster,{hasBox:false});
+assert.deepEqual(calibrated.axis.ticks.map(t=>t.value),[0,2,4]);
+assert.ok(calibrated.yAxis.calibration.b<0,'open axes calibrate using real negative/zero/positive labels');
+const prepared=preparePlotModel(calibrated,raster,{hasBox:false});
+assert.equal(prepared.elements.filter(e=>e.kind==='line' && e.role==='reference').length,0,'duplicate baseline removed without a box');
+assert.ok(prepared.elements.some(e=>e.role==='axis'),'L-shaped axes survive deduplication');
+assert.equal(preparePlotModel({...calibrated,elements:calibrated.elements.concat({kind:'polyline',role:'annotation',points:[[100,300],[300,700],[500,300]],style:{stroke:'#ee3025'}})},raster,{hasBox:false}).elements.some(e=>e.kind==='polyline' && e.role==='annotation'),false,'a data-coloured duplicate cannot bypass ownership by calling itself an annotation');
+assert.equal(prepared.geometryCheck.ok,true);
+const out=primitivesToTikz(prepared,{aspect:1,imageWidthPx:400});
+assert.equal(out.stats.kinds.marker,11);
+assert.equal((out.code.match(/\{0\}/g)||[]).length,2,'x zero and y zero are separate labels');
+
+const broken={...prepared,curves:[{...series,connection:'smooth',geometry:undefined,expectedPointCount:undefined}]};
+const relation={kind:'crossing',seriesId:'data',withSeriesId:'ref',count:10};
+const fixed=applyPlotRevision(broken,{curves:[series,reference],relations:[relation]},raster,{hasBox:false});
+assert.equal(fixed.curves[0].geometry.kind,'polyline');
+assert.equal(fixed.relationResult.ok,true,'repair replaces relations and rebuilds final geometry');
+assert.equal(fixed.curves[0].geometry.vertices.length,11);
+assert.equal(evaluateGeometry(fixed.curves[0].geometry,points[1][0]),points[1][1]);
+const valid={model:fixed,compiled:{ok:true},visual:{score:82,pass:true},geometry:{recall:0.9},evidence:{figureClass:'plot',plots:2}};
+const invalid={...valid,model:{...fixed,relationResult:{ok:false}},visual:{score:99,pass:true}};
+assert.ok(candidateRank(valid)>candidateRank(invalid),'hard failures cannot win rollback through a higher visual score');
+
+const pairs=[{px:50,value:0},{px:100,value:2},{px:150,value:4},{px:190,value:50},{px:100,value:2}];
+const ticks=buildTicks(pairs,{y:320});
+assert.deepEqual(ticks.ticks.map(t=>t.value),[0,2,4],'outliers and duplicates are not emitted');
+assert.equal(ticks.calibration.dropped,1);
+assert.equal((tickTikz(ticks.ticks.concat(ticks.ticks)).match(/\\draw/g)||[]).length,3);
+console.log('plot revision: shared geometry, negative axes, ticks, reference deduplication and candidate ranking passed');
+const ocr=normalizeRecognizedLabels({labels:[{tex:'0',bounds:{left:150,top:840,right:170,bottom:880}},{tex:'0',bounds:{left:70,top:440,right:90,bottom:470}}]});
+assert.deepEqual(ocr[0].box,[150,840,20,40],'named edges are converted exactly once');
+assert.equal(ocr.length,2,'two printed zero labels survive');
+assert.equal(pruneUnsupported({elements:ocr.map(l=>({kind:'text',...l}))},{support:[]}).model.elements.length,2,'pruning respects separate glyph positions');
+assert.throws(()=>normalizeRecognizedLabels({labels:[{tex:'0',box:[150,840,170,880]}]}),/OCR_BOX_PROTOCOL/,'ambiguous legacy box arrays cannot corrupt calibration');
+assert.throws(()=>normalizeRecognizedLabels({labels:[{tex:'0',bounds:{left:150,top:840,right:170,bottom:1720}}]}),/OCR_BOX_PROTOCOL/);
+console.log('named OCR edges and duplicate-number occurrences passed');

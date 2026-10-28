@@ -13,9 +13,8 @@
 
 import { cjkPreamble, safeNodeText } from "./textext.mjs";
 import { catmullRom } from "./plotcurve.mjs";
-import { monotoneSegments } from "./digitize.mjs";
-import { chooseModel, segmentShape, fitPieces, fitAdaptive } from "./spline.mjs";
-import { chooseFamily, familyTikz } from "./family.mjs";
+import { familyTikz } from "./family.mjs";
+import { normalizeSeries, compileSeriesGeometry } from './series-geometry.mjs';
 
 const DEFAULT_WIDTH_CM = 12;
 const MAX_ELEMENTS = 200;
@@ -125,7 +124,7 @@ export function primitivesToTikz(model, options) {
   for (const el of raw) {
     if (!el || el.kind !== "text" || !Array.isArray(el.box)) continue;
     // One string, one node: a model that lists "−6" twice must not draw it twice.
-    const key = String(el.tex || "").replace(/\s+/g, "").toLowerCase();
+    const key = String(el.tex || "").replace(/\s+/g, "").toLowerCase() + ':' + (el.box || []).slice(0,2).map(v=>Math.round(v/10)).join(',');
     if (key) {
       if (seenText.has(key)) { dropped++; continue; }
       seenText.add(key);
@@ -331,109 +330,45 @@ export function primitivesToTikz(model, options) {
       // family / split-path emitters referenced an `opt` that did not exist.
       const curveStyle = (curve && curve.style) || {};
       const curveStroke = hexOrNull(curveStyle.stroke || curve.color) || "#000000";
-      const curveWidth = Math.max(0.2, Math.min(2.5, num(curveStyle.width == null ? curve.width : curveStyle.width, 2) * pxToPt));
+      const curveWidth = Math.max(0.2, Math.min(12, num(curveStyle.width == null ? curve.width : curveStyle.width, 2) * pxToPt));
       const curveDash = dashOf(curveStyle.dash != null ? curveStyle : curve);
-      const curveOpt = ["draw=" + rgbSpec(curveStroke), "line width=" + curveWidth + "pt", "line cap=round", "line join=round"]
-        .concat(curveDash ? [curveDash] : []).join(", ");
-      // §11: a curve given by many points is reduced to a FINITE parameter set
-      // (<= 8 spline parameters) instead of being chained into dozens of Béziers.
-      let fit = curve?.interpolation === 'monotone' ? monotoneSegments(curve.points) : catmullRom(curve && curve.points);
-      if (Array.isArray(curve?.points) && curve.points.length >= 4) {
-        try {
-          const pts = curve.points.map((p) => [Number(p[0]), Number(p[1])]);
-          // Sparse scientific curves are continuous by default. A steep peak is
-          // not a discontinuity; split only when the semantic recogniser marks
-          // a real printed gap explicitly.
-          const maySplit = curve.continuous === false || curve.discontinuous === true;
-          const split = maySplit ? segmentShape(pts, {}) : { pieces: [{ points: pts }], corners: 0, jumps: 0 };
-          const pieces = split.pieces.length > 1 ? fitPieces(split.pieces, { tolerance: 6, maxK: 8 }) : null;
-          if (pieces && pieces.length > 1) {
-            fit = { pieces: pieces.filter((m) => m && m.segments).map((m) => ({ segments: m.segments.map((s) => ({ p1: s.p0, c1: s.p1, c2: s.p2, p2: s.p3 })) })) };
-            items.push("分段拟合 · " + pieces.length + " 段（拐角 " + split.corners + " · 跳变 " + split.jumps + "）");
-          } else {
-            // §10.3: try a compact family first. It is used only when it explains
-            // the evidence better than the spline with fewer parameters.
-            let splineFit = null;
-            try { splineFit = fitAdaptive(pts, { tolerance: 6, maxK: 8 }); } catch (err) { splineFit = null; }
-            const family = chooseFamily(pts, {
-              tolerance: 8,
-              spline: splineFit ? { params: splineFit.params, rmse: splineFit.rmse } : null,
-            });
-            if (family) {
-              const evidenceDomain = [Math.min(...pts.map((p) => p[0])), Math.max(...pts.map((p) => p[0]))];
-              const reachesFrame = frameDomain && evidenceDomain[0] - frameDomain[0] <= 150 && frameDomain[1] - evidenceDomain[1] <= 150;
-              fit = { family, domain: reachesFrame ? frameDomain : evidenceDomain };
-              items.push("参数族拟合 · " + family.family + " · " + family.params.length + " 参数 · 残差 " + family.rmse.toFixed(1));
-            } else {
-            const model = chooseModel(pts, { tolerance: 6, maxK: 8 });
-            if (model && model.ok && model.kind === "spline" && model.segments && model.segments.length) {
-              fit = { segments: model.segments.map((s) => ({ p1: s.p0, c1: s.p1, c2: s.p2, p2: s.p3 })) };
-              items.push("样条拟合 · " + model.params + " 参数 · 残差 " + model.rmse.toFixed(1) + (model.ok ? "" : "（未达误差要求）"));
-            } else if (model && model.ok && model.kind === "line") {
-              fit = { segments: model.segments.map((s) => ({ p1: s.p0, c1: s.p1, c2: s.p2, p2: s.p3 })) };
-              items.push("该曲线判定为直线");
-            } else if (model && !model.ok) {
-              // Retain the sparse evidence interpolation, but never present a
-              // rejected regression as an accepted fit.
-              items.push("稀疏控制点插值 · 拟合未过残差门槛");
-            }
-            }
+      const curveOpt = ["draw=" + rgbSpec(curveStroke), "line width=" + curveWidth + "pt", curve.dashOnPx ? 'line cap=butt' : "line cap=round", "line join=round"]
+        .concat(curve.dashOnPx && curve.dashOffPx ? ['dash pattern=on '+fmt(curve.dashOnPx*pxToPt)+'pt off '+fmt(curve.dashOffPx*pxToPt)+'pt'] : curveDash ? [curveDash] : []).join(", ");
+      const series = normalizeSeries(curve);
+      const geometry = compileSeriesGeometry(series, { frameDomain });
+      items.push(geometry.description || (series.connection + ' · ' + series.points.length + ' 点'));
+      const point = p => '(' + X(p[0]) + ',' + Y(p[1]) + ')';
+      const markerCode = [];
+      if (series.marker.shape !== 'none') {
+        const radius = fmt(series.marker.radiusPx * pxToPt / 28.3465);
+        const fill = series.marker.filled ? rgbSpec(curveStroke) : 'white';
+        for (const p of series.points) {
+          const markerOpt = 'draw=' + rgbSpec(curveStroke) + ',fill=' + fill + ',line width=' + Math.min(curveWidth, 0.8) + 'pt';
+          if (series.marker.shape === 'circle') markerCode.push('\\draw[' + markerOpt + '] ' + point(p) + ' circle (' + radius + ');');
+          else {
+            const dx = series.marker.radiusPx / (opts.imageWidthPx || 700) * 1000;
+            const dy = dx / aspect;
+            const vertices = series.marker.shape === 'square' ? [[p[0]-dx,p[1]-dy],[p[0]+dx,p[1]-dy],[p[0]+dx,p[1]+dy],[p[0]-dx,p[1]+dy]]
+              : series.marker.shape === 'diamond' ? [[p[0],p[1]-dy],[p[0]+dx,p[1]],[p[0],p[1]+dy],[p[0]-dx,p[1]]]
+              : [[p[0],p[1]-dy],[p[0]+dx,p[1]+dy],[p[0]-dx,p[1]+dy]];
+            markerCode.push('\\draw[' + markerOpt + '] ' + vertices.map(point).join(' -- ') + ' -- cycle;');
           }
-        } catch (err) { /* fall back to the sparse interpolation */ }
-      }
-      if (!fit) { dropped++; continue; }
-      // A compact family is emitted as a function plot, not as points.
-      if (fit.family) {
-        const stmt = familyTikz(
-          fit.family,
-          [fit.domain[0] / 1000 * widthCm, fit.domain[1] / 1000 * widthCm],
-          {
-            style: curveOpt,
-            inputExpression: "(1000*\\x/" + widthCm + ")",
-            outputScale: -heightCm / 1000,
-            outputOffset: heightCm,
-          },
-        );
-        if (stmt) { body.push(stmt); curveCount++; continue; }
-      }
-      // A split curve is drawn as independent paths: a jump must not be bridged.
-      if (fit.pieces) {
-        for (const piece of fit.pieces) {
-          if (!piece.segments || !piece.segments.length) continue;
-          let out = "\\draw[" + curveOpt + "] (" + X(piece.segments[0].p1[0]) + "," + Y(piece.segments[0].p1[1]) + ")";
-          for (const s of piece.segments) {
-            out += " .. controls (" + X(s.c1[0]) + "," + Y(s.c1[1]) + ") and (" + X(s.c2[0]) + "," + Y(s.c2[1]) + ") .. (" + X(s.p2[0]) + "," + Y(s.p2[1]) + ")";
-          }
-          body.push(out + ";");
-          curveCount++;
         }
-        continue;
+        kinds.marker = (kinds.marker || 0) + series.points.length;
       }
-      const style = (curve && curve.style) || {};
-      const stroke = hexOrNull(style.stroke || curve.color) || "#000000";
-      const width = Math.max(0.2, Math.min(2.5, num(style.width == null ? curve.width : style.width, 2) * pxToPt));
-      const dash = dashOf(style.dash != null ? style : curve);
-      const head = ["draw=" + rgbSpec(stroke), "line width=" + width + "pt", "line cap=round", "line join=round"];
-      if (dash) head.push(dash);
-      const segmentCode = s => {
-          return ".. controls (" + X(s.c1[0]) + "," + Y(s.c1[1]) + ") and (" + X(s.c2[0]) + "," + Y(s.c2[1]) + ") .. (" + X(s.p2[0]) + "," + Y(s.p2[1]) + ")";
-      };
-      const groups = [];
-      for (let i = 0; i < fit.segments.length; i++) {
-        const color = hexOrNull(curve.colors?.[i]) || stroke;
-        const last = groups.at(-1);
-        const difference = last ? Math.hypot(...[1, 3, 5].map(j => parseInt(color.slice(j, j + 2), 16) - parseInt(last.color.slice(j, j + 2), 16))) : Infinity;
-        const segmentWidth = curve.widths?.[i] != null ? curve.widths[i] * pxToPt : width;
-        if (difference < 24 && Math.abs(last.width - segmentWidth) < 0.2) last.segments.push(fit.segments[i]);
-        else groups.push({ color, width: segmentWidth, segments: [fit.segments[i]] });
+      if (geometry.kind === 'family') {
+        curveBody.push(familyTikz(geometry.fit, geometry.domain.map(x => x / 1000 * widthCm), {
+          style: curveOpt, inputExpression: '(1000*\\x/' + widthCm + ')', outputScale: -heightCm / 1000, outputOffset: heightCm,
+        }));
+      } else if (geometry.kind === 'polyline') {
+        curveBody.push('\\draw[' + curveOpt + '] ' + geometry.vertices.map(point).join(' -- ') + ';');
+      } else if (geometry.kind === 'bezier') {
+        for (const path of geometry.paths) {
+          const chain = point(path[0].p0) + path.map(s => ' .. controls ' + point(s.p1) + ' and ' + point(s.p2) + ' .. ' + point(s.p3)).join('');
+          curveBody.push('\\draw[' + curveOpt + '] ' + chain + ';');
+        }
       }
-      for (const group of groups) {
-        const start = group.segments[0].p1;
-        const chain = ["(" + X(start[0]) + "," + Y(start[1]) + ")", ...group.segments.map(segmentCode)].join(' ');
-        const options = ['draw=' + rgbSpec(group.color), 'line width=' + group.width + 'pt', ...head.slice(2)];
-        if (curve.dashPeriodPx > 0) options.push('dash pattern=on 0pt off ' + (curve.dashPeriodPx * pxToPt) + 'pt');
-        curveBody.push("\\draw[" + options.join(", ") + "] " + chain + ";");
-      }
+      curveBody.push(...markerCode);
       curveCount++;
       kinds.curve = (kinds.curve || 0) + 1;
     }

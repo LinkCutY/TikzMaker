@@ -7,7 +7,9 @@
  * never survive its label (which is how "labels swapped" appeared).
  */
 
+import { safeNodeText } from './textext.mjs';
 const isNum = (v) => Number.isFinite(Number(v));
+export const legendLabelKey = value => safeNodeText(value).replace(/\$/g,'').replace(/[{}\s]/g,'');
 
 /** Build one entry from a detected sample stroke and its label block. */
 export function makeLegendEntry({ index, sample, label, seriesId }) {
@@ -117,7 +119,7 @@ function colourSpec(hex) {
   if (!m) return "black";
   return "{rgb,255:red," + parseInt(m[1], 16) + ";green," + parseInt(m[2], 16) + ";blue," + parseInt(m[3], 16) + "}";
 }
-const texOf = (entry) => (entry.mode === "text" ? entry.tex : "$" + String(entry.tex).replace(/^\$|\$$/g, "") + "$");
+const texOf = (entry) => safeNodeText(entry.mode === "text" ? entry.tex : "$" + String(entry.tex).replace(/^\$|\$$/g, "") + "$");
 
 /**
  * Emit samples and labels from the SAME baseline, so moving an entry moves both.

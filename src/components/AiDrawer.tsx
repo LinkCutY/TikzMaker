@@ -602,7 +602,7 @@ export function AiDrawer() {
               ok: Boolean(event.ok),
               attempts: event.attempts ?? 1,
               rounds: event.rounds,
-              phased: event.timedOut
+              phased: event.timedOut || event.reason === "TIME_BUDGET" || event.reason === "TIMEOUT"
                 ? "budget"
                 : event.reason === "STUCK"
                   ? "stuck"
@@ -1284,6 +1284,12 @@ export function AiDrawer() {
                     ? visualReview?.pass ? "视觉校验通过" : "编译通过"
                     : result.reason === "GEOMETRY_REJECTED"
                       ? "几何核对未通过"
+                    : result.reason === "SCENE_REJECTED"
+                      ? "图形结构校验未通过"
+                    : result.reason === "REVIEW_UNAVAILABLE"
+                      ? "未取得有效视觉评审"
+                    : result.reason === "APPROXIMATION_REQUIRED"
+                      ? "已生成近似结果，需核对细节"
                     : result.reason === "REVIEW_REJECTED"
                       ? "视觉评审未通过"
                     : result.panelsDone !== undefined
@@ -1292,7 +1298,9 @@ export function AiDrawer() {
                       ? "输出超长，未完成"
                       : result.phased === "budget"
                         ? "达到时间上限，已停止"
-                        : "仍有编译错误"}
+                        : result.reason === "COMPILE_FAILED"
+                          ? "仍有编译错误"
+                          : "生成未完成"}
                 </span>
                 <span className="hint mono">
                   {result.size ? `${(result.size.chars / 1000).toFixed(1)}K 字符 · ${result.size.lines} 行 · ` : ""}

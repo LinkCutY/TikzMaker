@@ -12,6 +12,7 @@
 
 import { decodePng } from "./trace.mjs";
 import { sampleCurve } from "./plotcurve.mjs";
+import { sampleGeometry } from './series-geometry.mjs';
 
 const INF = 1e9;
 
@@ -149,7 +150,7 @@ export function evaluateModel(model, aspect, raster, options) {
   // the model chose actually sit on ink.
   const curveList = Array.isArray(model && model.curves) ? model.curves : [];
   curveList.forEach(function (curve, i) {
-    const pts = sampleCurve(curve && curve.points);
+    const pts = curve.geometry ? sampleGeometry(curve.geometry) : sampleCurve(curve && curve.points);
     if (pts.length < 2) return;
     let ok = 0;
     for (const p of pts) {
@@ -468,7 +469,7 @@ export function pruneUnsupported(model, evaluation, options) {
   const removed = [];
   (model.elements || []).forEach(function (el, index) {
     if (bad.has(index)) { removed.push({ index, kind: el && el.kind, why: "no-ink" }); return; }
-    const key = JSON.stringify([el.kind, el.cx, el.cy, el.r, el.rx, el.ry, el.x1, el.y1, el.x2, el.y2, el.tex,
+    const key = JSON.stringify([el.kind, el.cx, el.cy, el.r, el.rx, el.ry, el.x1, el.y1, el.x2, el.y2, el.tex,el.box,el.role,
       (el.points || []).map(function (p) { return [Math.round(p[0]), Math.round(p[1])]; })]);
     if (seen.has(key)) { removed.push({ index, kind: el && el.kind, why: "duplicate" }); return; }
     seen.add(key);

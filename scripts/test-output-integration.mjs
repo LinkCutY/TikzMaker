@@ -45,10 +45,11 @@ const legend = emitLegendTikz([
   makeLegendEntry({
     index: 0,
     sample: { x0: 100, x1: 160, y0: 100, y1: 100, color: "#917fa4", width: 2 },
-    label: { tex: "\\gamma(z)" },
+    label: { tex: "$γ(z)$" },
     seriesId: "curve0",
   }),
 ]);
+assert.ok(legend.includes('\\gamma(z)') && !legend.includes('γ'),'Unicode Greek is converted even inside math delimiters');
 await compile("\\begin{tikzpicture}\n" + legend + "\n\\end{tikzpicture}", "legend");
 
 const points = Array.from({ length: 9 }, (_, i) => [

@@ -1,13 +1,15 @@
 /**
- * Sparse curve landmarks and the 12-point control budget (§4, §5).
+ * Sparse curve landmarks and the adaptive structural control budget.
  *
- * The model may return more than 12 points per series. We must keep the
+ * The model may return more points than the curve needs. We must keep the
  * SCIENTIFIC evidence (endpoints, extrema, crossings, plateau edges, strong
  * inflections) and fill the remaining budget by geometric significance. This
  * is the opposite of uniform / every-Nth sampling, which is exactly how a
  * single central dip gets averaged away.
  */
 
+import { isObservationSeries, normalizeSeries } from './series-geometry.mjs';
+import { CURVE_BUDGET, analyzeCurveBudget } from './curve-budget.mjs';
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 const isFinitePoint = (p) => Array.isArray(p) && Number.isFinite(Number(p[0])) && Number.isFinite(Number(p[1]));
@@ -44,7 +46,7 @@ export function normalizePlotInput(input) {
 }
 
 const LANDMARK_KINDS = new Set([
-  "left-end", "right-end", "minimum", "maximum", "crossing", "platform-edge",
+  "left-end", "right-end", "minimum", "maximum", "crossing", "platform-edge", "plateau-edge",
   "inflection", "axis-contact", "jump", "apex", "shoulder",
 ]);
 
@@ -60,10 +62,13 @@ export function validatePlotModel(input, options) {
   const errors = [];
   const warnings = [];
   const ids = new Set(series.map((s) => s.id));
+  if (ids.size !== series.length) errors.push('series ids must be unique');
 
   series.forEach((s) => {
-    if (strict && s.points.length > 12) {
-      warnings.push(`${s.id}: ${s.points.length} points exceed the 12-point budget (will be reduced)`);
+    try { normalizeSeries(s); } catch (err) { errors.push(s.id + ': ' + err.message); }
+    const budget = analyzeCurveBudget(s.points, opts);
+    if (strict && !isObservationSeries(s) && s.points.length > budget.budget) {
+      warnings.push(`${s.id}: ${s.points.length} points exceed adaptive budget ${budget.budget} (preserve structural landmarks)`);
     }
     const kinds = new Map();
     (s.landmarks || []).forEach((l, i) => {
@@ -84,7 +89,7 @@ export function validatePlotModel(input, options) {
     if (!["vertical-order", "axis-contact", "crossing", "same-extremum"].includes(r.kind)) {
       errors.push(`relations[${i}]: unsupported relation kind "${r.kind}"`);
     }
-    const refs = [r.seriesId, r.aboveSeriesId, r.belowSeriesId, r.withSeriesId].filter(Boolean);
+    const refs = [r.seriesId, r.aboveSeriesId, r.belowSeriesId, r.withSeriesId, r.at?.seriesId].filter(Boolean);
     refs.forEach((id) => {
       if (typeof id === "string" && !ids.has(id)) errors.push(`relations[${i}]: unknown seriesId "${id}"`);
     });
@@ -106,13 +111,17 @@ function nearestIndex(pts, p, tolerance) {
 }
 
 /**
- * Reduce a series to at most 12 control points while preserving the mandatory
+ * Reduce a series to its adaptive control budget while preserving the mandatory
  * scientific landmarks. Returns { points, landmarks, dropped, preservedKinds,
  * extremumError }.
  */
 export function selectControlPoints(curve, options) {
   const opts = options || {};
-  const budget = Math.max(6, Math.min(12, opts.budget == null ? 12 : opts.budget));
+  if (isObservationSeries(curve)) {
+    const series = normalizeSeries(curve);
+    return { points: series.points, landmarks: series.landmarks || [], dropped: 0,
+      preservedKinds: (series.landmarks || []).map(l => l.kind), extremumError: { minShift: 0, maxShift: 0 } };
+  }
   const snap = opts.snapTolerance == null ? 6 : opts.snapTolerance;
   const original = sortPoints(curve && curve.points);
   const landmarks = Array.isArray(curve && curve.landmarks) ? curve.landmarks.filter((l) => l && isFinitePoint(l.point)) : [];
@@ -121,12 +130,11 @@ export function selectControlPoints(curve, options) {
   // Build a working point set that also contains landmark points the model may
   // have reported separately from the dense point list.
   const pts = original.map((p) => ({ point: p.slice(), source: "point", idx: -1 }));
-  const landmarkIdx = [];
   landmarks.forEach((l) => {
     const p = l.point.map(Number);
     const hit = nearestIndex(pts.map((x) => x.point), p, snap);
-    if (hit >= 0) { landmarkIdx.push(hit); pts[hit].landmarkKinds = (pts[hit].landmarkKinds || []).concat(l.kind); }
-    else { landmarkIdx.push(pts.length); pts.push({ point: p, source: "landmark", landmarkKinds: [l.kind] }); }
+    if (hit >= 0) { pts[hit].landmarkKinds = (pts[hit].landmarkKinds || []).concat(l.kind); }
+    else { pts.push({ point: p, source: "landmark", landmarkKinds: [l.kind] }); }
   });
 
   // Sort again after landmark injection.
@@ -142,17 +150,16 @@ export function selectControlPoints(curve, options) {
   const endpoints = new Set([0, pts.length - 1]);
   endpoints.add(minIdx); endpoints.add(maxIdx);
 
-  // Slope sign changes = missed local extrema.
-  const slopeExtrema = [];
-  for (let i = 1; i + 1 < pts.length; i++) {
-    const d1 = pointAt(i)[1] - pointAt(i - 1)[1];
-    const d2 = pointAt(i + 1)[1] - pointAt(i)[1];
-    if (d1 !== 0 && d2 !== 0 && Math.sign(d1) !== Math.sign(d2)) slopeExtrema.push(i);
-  }
-
+  const adaptive = analyzeCurveBudget(pts.map(p => p.point), opts);
   const mandatory = new Set(endpoints);
-  landmarkIdx.forEach((i) => mandatory.add(i));
-  slopeExtrema.forEach((i) => mandatory.add(i));
+  pts.forEach((p, i) => { if (p.landmarkKinds?.length) mandatory.add(i); });
+  adaptive.mandatoryIndices.forEach((i) => mandatory.add(i));
+  if (mandatory.size > CURVE_BUDGET.maxPoints) {
+    throw new Error('CURVE_BUDGET: split ' + (curve.id || 'curve') + ' at meaningful boundaries; never discard mandatory structure');
+  }
+  const requested = Number.isFinite(opts.budget) ? Math.floor(opts.budget) : adaptive.budget;
+  // Explicit semantic landmarks take precedence over a requested smaller quota.
+  const budget = Math.min(CURVE_BUDGET.maxPoints, Math.max(2, requested, mandatory.size));
 
   // Geometric significance for filling the remaining budget: distance from the
   // chord between the two nearest neighbours, normalised by their distance.
@@ -173,20 +180,6 @@ export function selectControlPoints(curve, options) {
   while (chosen.length < budget && cursor < pool.length) {
     const i = pool[cursor++];
     if (!chosen.includes(i)) chosen.push(i);
-  }
-
-  // Never delete endpoints or the global extrema, even when mandatory itself
-  // exceeds the budget.
-  const protectedSet = new Set([...endpoints]);
-  const protectedList = [...protectedSet].filter((i) => !chosen.includes(i));
-  if (chosen.length + protectedList.length > budget) {
-    // Drop the least significant non-protected mandatory points first.
-    const protectedIndices = new Set(protectedList.concat([...protectedSet]));
-    chosen.sort((a, b) => (protectedIndices.has(a) ? -1e9 : significance(a)) - (protectedIndices.has(b) ? -1e9 : significance(b)));
-    chosen.length = budget;
-    for (const i of protectedList) if (!chosen.includes(i) && chosen.length < budget) chosen.push(i);
-  } else {
-    for (const i of protectedList) chosen.push(i);
   }
 
   const keptIndices = [...new Set(chosen)].sort((a, b) => pts[a].point[0] - pts[b].point[0] || pts[a].point[1] - pts[b].point[1]);

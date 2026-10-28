@@ -34,6 +34,11 @@ const elements = [
 ];
 const kept = removePlotDuplicates(elements, joined, frame, raster, { entries: [{}] }, { ticks: [{}] });
 assert.deepEqual(kept.map((el) => el.role || el.kind), ["text"], "measured frame, fitted curves and atomic legend should own their representations");
+const staleFrame=removePlotDuplicates([
+  {kind:'polyline',closed:true,points:[[50,20],[950,20],[950,200],[50,200]],style:{stroke:'#333333'}},
+  {kind:'line',x1:50,y1:200,x2:950,y2:200,style:{stroke:'#333333'}},
+],joined,frame,raster,null,{ticks:[]});
+assert.equal(staleFrame.length,0,'a model frame with the wrong height cannot coexist with the measured frame');
 
 const steep = primitivesToTikz({
   type: "plot", elements: [], curves: [{ continuous: true, color: "#aa8844", dash: "dotted", points: [[100, 100], [300, 100], [450, 200], [500, 800], [550, 200], [700, 100], [900, 100]] }],

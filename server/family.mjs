@@ -165,7 +165,7 @@ export const FAMILIES = {
 export function fitFamily(points, familyName, options) {
   const family = FAMILIES[familyName];
   if (!family || !points.length) return null;
-  const p0 = family.guess(points);
+  const p0 = Array.isArray(options?.initialParams) && options.initialParams.length === family.params.length ? options.initialParams.slice() : family.guess(points);
   const fit = levenbergMarquardt(points, family, p0, options);
   const ok = Number.isFinite(fit.rmse) && fit.rmse < 1e6;
   return { family: familyName, params: fit.params, rmse: fit.rmse, ok, k: fit.params.length };

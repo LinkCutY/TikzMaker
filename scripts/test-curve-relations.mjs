@@ -46,3 +46,23 @@ assert.equal(checkContinuity(steep).ok, true, "steep continuous curve is not spl
 const gap = { continuous: true, points: [[0, 0], [100, 0], [900, 0], [1000, 0]] };
 assert.equal(checkContinuity(gap).ok, false, "wide x-gap is reported");
 console.log("curve relations tests passed");
+
+// Regression: the screenshot's 882000 penalty came from choosing the TOP as minimum.
+const zigzag = { id:'red', connection:'linear', points:[[100,300],[200,650],[300,250],[400,700]] };
+const zero = { id:'zero', points:[[100,500],[400,500]] };
+const minimum = evaluateRelations({ series:[zigzag,zero], relations:[{kind:'vertical-order',
+  at:{kind:'minimum',seriesId:'red'},aboveSeriesId:'zero',belowSeriesId:'red',marginPx:10}] });
+assert.equal(minimum.ok,true);
+assert.equal(minimum.checks[0].x,400);
+assert.equal(minimum.checks[0].gap,200);
+const anchored = evaluateRelations({ series:[zigzag,zero], relations:[{kind:'vertical-order',
+  at:{kind:'maximum',seriesId:'red',interval:[150,350]},aboveSeriesId:'red',belowSeriesId:'zero',marginPx:10}] });
+assert.equal(anchored.checks[0].x,300,'at.seriesId chooses the requested series, not always below');
+const missing = evaluateRelations({series:[zero],relations:[{kind:'crossing',seriesId:'red',withSeriesId:'zero'}]});
+assert.equal(missing.ok,false,'unknown relation references cannot silently pass');
+const crossings = evaluateRelations({series:[zigzag,zero],relations:[{kind:'crossing',seriesId:'red',withSeriesId:'zero',count:3}]});
+assert.equal(crossings.ok,true);
+assert.equal(evaluateRelations({series:[zigzag,zero],relations:[{kind:'crossing',seriesId:'red',withSeriesId:'zero',count:1}]}).ok,false);
+const fitted = {id:'fit',points:[[0,100],[500,100],[1000,100]],geometry:{kind:'polyline',vertices:[[0,800],[1000,800]],domain:[0,1000]}};
+assert.equal(evaluateRelations({series:[fitted],yCalibration:yCal,relations:[{kind:'axis-contact',seriesId:'fit',value:0.2}]}).ok,true,'axis contact checks emitted geometry');
+console.log('extrema orientation, location references, crossings and emitted-geometry checks passed');

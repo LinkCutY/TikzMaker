@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <!-- ① 编码：head 的第一行。浏览器必须先知道编码，才能正确解码中文。 -->
+  <meta charset="UTF-8">
+
+  <!-- ② 视口：让手机按屏幕宽度显示。桌面浏览器也建议保留。 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!-- ③ 标题：显示在浏览器标签页上。 -->
+  <title>页面标题</title>
+
+  <!-- ④ 样式：页面“长什么样”。也可以改成 <link rel="stylesheet" href="styles.css">。 -->
+  <style>
+    body {
+      margin: 0;
+      font-family: system-ui, sans-serif;
+    }
+  </style>
+</head>
+<body>
+  <!-- ⑤ 可见内容：标题、段落、画布、按钮……都放在 body 里。 -->
+  <h1>标题</h1>
+  <p>段落</p>
+
+  <!-- ⑥ 脚本：放在 body 最后，保证上面的元素已经存在。 -->
+  <script>
+    console.log("页面加载完成");
+  </script>
+</body>
+</html>

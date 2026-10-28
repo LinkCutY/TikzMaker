@@ -39,3 +39,12 @@ const contact = fitJointSeries(
 );
 assert.ok(Number.isFinite(contact.loss), "joint loss is finite with axis contact");
 console.log("joint fit tests passed");
+
+const discrete = {id:'steps',connection:'linear',points:[[0,100],[250,800],[500,50],[750,900],[1000,0]],marker:{shape:'circle'}};
+const exact = fitJointSeries([discrete],[]);
+assert.equal(exact.candidates.length,1);
+assert.equal(exact.candidates[0].kind,'linear');
+assert.equal(exact.series[0].geometry.kind,'polyline');
+assert.equal(exact.terms.ext,0,'corners have no artificial zero-derivative penalty');
+assert.deepEqual(exact.series[0].geometry.vertices,discrete.points);
+console.log('joint selection preserves discrete geometry and corners');

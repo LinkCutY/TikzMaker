@@ -10,6 +10,17 @@
 import { fitAdaptive, evalPower, slopePower } from "./spline.mjs";
 import { fitFamily, familyValue, familyExpression } from "./family.mjs";
 import { evaluateRelations } from "./curve-relations.mjs";
+import { normalizeSeries, isObservationSeries, compileSeriesGeometry, evaluateGeometry, polylineGeometry } from './series-geometry.mjs';
+
+function attachGeometry(candidate, series) {
+  if (!candidate.geometry) {
+    if (candidate.kind === 'family') candidate.geometry = { kind:'family', fit:candidate.fit, domain:[series.points[0][0],series.points.at(-1)[0]] };
+    else if (candidate.kind === 'spline') candidate.geometry = { kind:'bezier', paths:[candidate.fit.segments], domain:candidate.fit.domain };
+    else if (candidate.kind === 'line') candidate.geometry = polylineGeometry([series.points[0],series.points.at(-1)].map(p=>[p[0],candidate.evalPixel(p[0])]));
+  }
+  candidate.evalPixel = x => evaluateGeometry(candidate.geometry,x);
+  return candidate;
+}
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
@@ -56,6 +67,10 @@ export function candidatesForSeries(series, options) {
   const opts = options || {};
   const points = (series.points || []).slice().sort((a, b) => a[0] - b[0]).filter((p) => Number.isFinite(p[0]) && Number.isFinite(p[1]));
   if (points.length < 2) return [];
+  series = normalizeSeries({ ...series, points });
+  if (isObservationSeries(series)) {
+    return [attachGeometry({kind:series.connection, k:points.length, rmse:0, geometry:compileSeriesGeometry(series)},series)];
+  }
   const cands = [];
   const line = linearFit(points);
   if (Number.isFinite(line.rmse)) cands.push(line);
@@ -65,20 +80,9 @@ export function candidatesForSeries(series, options) {
   // A sparse-interpolation fallback: exact through points, penalised heavily by
   // complexity so it only wins when the compact models genuinely cannot fit.
   if (points.length >= 2) {
-    cands.push({
-      kind: "sparse", k: Math.max(12, points.length), rmse: 0,
-      evalPixel: (x) => {
-        if (x <= points[0][0]) return points[0][1];
-        if (x >= points[points.length - 1][0]) return points[points.length - 1][1];
-        let i = 1; while (i < points.length - 1 && points[i][0] < x) i++;
-        const a = points[i - 1], b = points[i];
-        const t = (x - a[0]) / Math.max(1e-9, b[0] - a[0]);
-        return a[1] + t * (b[1] - a[1]);
-      },
-      derivative: () => 0,
-    });
+    cands.push({ kind:'sparse', k:Math.max(12,points.length), rmse:0, geometry:compileSeriesGeometry(series) });
   }
-  return cands;
+  return cands.map(c=>attachGeometry(c,series));
 }
 
 function landmarkWeights(series) {
@@ -98,6 +102,7 @@ function assignmentSeries(series, candidate, yCalibration, coordinateSpace) {
   const evalPixel = candidate.evalPixel;
   return Object.assign({}, series, {
     points: series.points,
+    geometry: candidate.geometry,
     evalPixel,
     evalData: toValue ? (x) => toValue(evalPixel(x)) : undefined,
     coordinateSpace,
@@ -152,21 +157,25 @@ export function fitJointSeries(series, relations, options) {
     });
     let ext = 0;
     indices.forEach((ci, i) => {
-      const x = extremumX(per[i].series);
-      if (x == null) return;
-      ext += derivativeAt(chosen[i], x) ** 2;
+      if (isObservationSeries(per[i].series)) return;
+      for (const landmark of per[i].series.landmarks || []) {
+        if (!['minimum','maximum'].includes(landmark.kind)) continue;
+        const x = landmark.point?.[0];
+        if (!Number.isFinite(x) || x <= per[i].series.points[0][0] || x >= per[i].series.points.at(-1)[0]) continue;
+        ext += derivativeAt(chosen[i], x) ** 2;
+      }
     });
 
-    const rel = evaluateRelations({ series: models, relations, yCalibration, coordinateSpace, options: opts });
+    const rel = evaluateRelations({ series: models, relations, yCalibration, coordinateSpace, options: { ...opts, allowMissing: indices.length < per.length } });
     let order = 0, axis = 0;
     for (const check of rel.checks) {
       if (check.kind === "vertical-order" && !check.ok) order += Math.max(0, check.margin - check.gap) ** 2;
-      if (check.kind === "axis-contact" && !check.ok) axis += Math.abs(check.actual - check.expected) ** 2;
+      if (check.kind === "axis-contact" && !check.ok && Number.isFinite(check.actual)) axis += Math.abs(check.actual - check.expected) ** 2;
     }
 
     const complexity = chosen.reduce((s, c) => s + c.k, 0);
-    const hardFail = rel.failures.some((f, k) => {
-      const r = relations[k];
+    const hardFail = rel.failures.some((f) => {
+      const r = relations.find((r,i) => (r.id || `relations[${i}]`) === f.tag);
       return !r || (r.confidence == null ? true : r.confidence >= hardConfidence);
     });
 
@@ -192,9 +201,10 @@ export function fitJointSeries(series, relations, options) {
   const bestState = states[0];
   const meta = bestState ? bestState.meta : null;
   if (!meta) return { ok: false, assignment: [], loss: Infinity, terms: {}, series };
-  const chosen = meta.chosen.map((c) => ({ kind: c.kind, family: c.family, k: c.k, rmse: c.rmse, fit: c.fit, evalPixel: c.evalPixel }));
+  const chosen = meta.chosen.map((c) => ({ kind: c.kind, family: c.family, k: c.k, rmse: c.rmse, fit: c.fit, geometry:c.geometry, evalPixel: c.evalPixel }));
   const outSeries = series.map((s, i) => Object.assign({}, s, {
     evalPixel: chosen[i].evalPixel,
+    geometry: chosen[i].geometry,
     evalData: yCalibration && yCalibration.ok ? (x) => yCalibration.toValue(chosen[i].evalPixel(x)) : undefined,
     candidate: chosen[i],
     coordinateSpace,

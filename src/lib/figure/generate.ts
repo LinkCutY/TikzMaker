@@ -102,7 +102,7 @@ export function elementToTikz(el: Element): string[] {
       }
       if (e.start && e.path?.length) {
         const chain = e.path.map((s) => `.. controls ${pt(s.c1)} and ${pt(s.c2)} .. ${pt(s.p)}`).join(" ");
-        return [`\\draw${styleOpts(e.style, e.closed)} ${pt(e.start)} ${chain};`];
+        return [`\\draw${styleOpts(e.style, e.closed)} ${pt(e.start)} ${chain}${e.closed ? ' -- cycle' : ''};`];
       }
       const path = e.smooth
         ? `plot[${e.closed ? "smooth cycle" : "smooth"}] coordinates {${e.points.map(pt).join(" ")}}`
@@ -120,7 +120,8 @@ export function elementToTikz(el: Element): string[] {
       }
       if (e.anchor !== "center") extra.push(`anchor=${e.anchor}`);
       const f = fontOpt(e.fontSize);
-      if (f) extra.push(f);
+      if (f) extra.push(f + (e.fontFamily === 'sans' ? '\\sffamily' : '') + (e.bold ? '\\bfseries' : ''));
+      if (e.rotate) extra.push(`rotate=${fmtNum(e.rotate)}`);
       // LaTeX commands outside $…$ always break the build ("Missing $ inserted").
       // Legacy documents lost their delimiters before the parser kept them, so
       // wrap bare markup here rather than emitting uncompilable code.

@@ -569,7 +569,7 @@ function ElementView({ el, cam, dim }: { el: Element; cam: Camera; dim: boolean 
           const c1 = S(seg.c1), c2 = S(seg.c2), p = S(seg.p);
           d += ` C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${p.x} ${p.y}`;
         }
-        return <path d={d} {...common} fill="none" />;
+        return <path d={d + (el.closed ? ' Z' : '')} {...common} fill={el.closed ? fill : 'none'} />;
       }
       if (el.rings?.length) {
         const d = [el.points, ...el.rings].map(ring => ring.map((p, i) => { const s = S(p); return `${i ? "L" : "M"} ${s.x} ${s.y}`; }).join(" ") + " Z").join(" ");
@@ -598,7 +598,7 @@ function ElementView({ el, cam, dim }: { el: Element; cam: Camera; dim: boolean 
       const anchorX = el.anchor.includes("west") ? "start" : el.anchor.includes("east") ? "end" : "middle";
       const textX = el.anchor.includes("west") ? screenBox.x + 4 * PT_CM * cam.s : el.anchor.includes("east") ? screenBox.x + screenBox.w - 4 * PT_CM * cam.s : cx;
       return (
-        <g opacity={opacity}>
+        <g opacity={opacity} transform={el.rotate ? `rotate(${-el.rotate} ${cx} ${cy})` : undefined}>
           {el.boxed && (
             <rect
               x={screenBox.x}
@@ -618,7 +618,7 @@ function ElementView({ el, cam, dim }: { el: Element; cam: Camera; dim: boolean 
             textAnchor={anchorX}
             dominantBaseline="central"
             className={mathish ? "canvas-node-text canvas-node-text--math" : "canvas-node-text"}
-            style={{ fontSize: el.fontSize * PT_CM * cam.s, fill: resolveColor(el.style.color) }}
+            style={{ fontSize: el.fontSize * PT_CM * cam.s, fill: resolveColor(el.style.color), fontFamily: el.fontFamily === 'sans' ? 'Arial, sans-serif' : undefined, fontWeight: el.bold ? 'bold' : undefined }}
           >
             {displayText(el.text) || " "}
           </text>

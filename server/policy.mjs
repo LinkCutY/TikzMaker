@@ -7,6 +7,8 @@
  * retries and legacy fields. This module is the single place that decides.
  */
 
+import { CURVE_BUDGET } from './curve-budget.mjs';
+
 export class PolicyError extends Error {
   constructor(code, message) {
     super(message);
@@ -48,7 +50,8 @@ export const COMPLEXITY_BUDGET = {
   edges: 120,
   labels: 80,
   curves: 24,
-  controlPointsPerCurve: 12,
+  controlPointsPerCurve: CURVE_BUDGET.maxPoints,
+  observationsPerSeries: 80,
   totalElements: 220,
 };
 

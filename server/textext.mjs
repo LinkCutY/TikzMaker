@@ -38,8 +38,8 @@ const GREEK = {
 export function safeNodeText(input) {
   let text = String(input == null ? "" : input).trim();
   if (!text) return text;
+  text = text.replace(/[α-ωΑ-Ω]/g, function (ch) { return GREEK[ch] ? "\\" + GREEK[ch] : ch; });
   if (text.includes("$")) return text;
-  text = text.replace(/[α-ωΑ-Ω]/g, function (ch) { return "\\" + GREEK[ch]; });
   const needsMath = /[_^]/.test(text) || /\\[a-zA-Z]+/.test(text);
   text = text.replace(/([%#&])/g, "\\$1");
   return needsMath ? "$" + text + "$" : text;

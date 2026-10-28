@@ -70,6 +70,9 @@ export interface NodeEl extends BaseEl {
   boxed: boolean;
   rounded: number;
   fontSize: number;
+  rotate?: number;
+  fontFamily?: 'serif' | 'sans';
+  bold?: boolean;
   anchor: "center" | "west" | "east" | "north" | "south" | "north west" | "north east" | "south west" | "south east";
 }
 

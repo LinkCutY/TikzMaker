@@ -20,6 +20,7 @@ assert.ok(landmarkOnly.points.some((p) => Math.abs(p[0] - 500) < 6), "landmark p
 // Old plot JSON (no landmarks/relations) stays valid.
 const legacy = validatePlotModel({ curves: [{ name: "x", color: "#000000", dash: "solid", continuous: true, points: [[0, 0], [500, 100], [1000, 0]] }] });
 assert.equal(legacy.ok, true);
+assert.equal(validatePlotModel({curves:[{id:'plateau',points:[[0,0],[1000,0]],landmarks:[{kind:'plateau-edge',point:[300,0]}]}]}).ok,true);
 
 // New protocol errors are caught.
 const bad = validatePlotModel({

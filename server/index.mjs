@@ -276,6 +276,7 @@ function aiPayload(req) {
     panelIndex: Number(panelIndex) || 0,
     budgetMs: Number(budgetMs) > 0 ? Number(budgetMs) : 0,
     image,
+    pipeline: ['auto','scene','legacy'].includes(req.body?.pipeline) ? req.body.pipeline : 'auto',
     baseUrl,
     model,
     temperature,

@@ -5,11 +5,12 @@
  * zero axis) must fail on its own.
  */
 
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+import { evaluateGeometry, sampleGeometry, isObservationSeries } from './series-geometry.mjs';
 
 function pointAt(series, x) {
   const pts = (series.points || []).slice().sort((a, b) => a[0] - b[0]);
   if (!pts.length) return NaN;
+  if (series.geometry) return evaluateGeometry(series.geometry, x);
   if (typeof series.evalPixel === "function") {
     const v = series.evalPixel(x);
     return Number.isFinite(v) ? v : NaN;
@@ -30,18 +31,23 @@ function valueAt(series, x, space, yCalibration) {
   return py;
 }
 
-function extremumOf(series, at, kind) {
-  const pts = (series.points || []).slice().sort((a, b) => a[0] - b[0]);
+export function extremumOf(series, at, kind, yCalibration) {
+  let pts = series.geometry ? sampleGeometry(series.geometry, 32) : (series.points || []).slice();
+  pts = pts.filter(p => p.every(Number.isFinite)).sort((a,b) => a[0]-b[0]);
   if (!pts.length) return null;
-  if (at && Array.isArray(at.point)) {
-    const x = Number(at.point[0]);
-    let best = pts[0];
-    pts.forEach((p) => { if (Math.abs(p[0] - x) < Math.abs(best[0] - x)) best = p; });
-    return { x: best[0], y: best[1] };
+  const landmark = at?.landmarkId ? (series.landmarks || []).find(l => l.id === at.landmarkId) : null;
+  const explicitX = Number(at?.x ?? at?.point?.[0] ?? landmark?.point?.[0]);
+  if (Number.isFinite(explicitX)) {
+    const y = pointAt(series, explicitX);
+    return Number.isFinite(y) ? { x: explicitX, y } : null;
   }
+  if (Array.isArray(at?.interval)) pts = pts.filter(p => p[0] >= at.interval[0] && p[0] <= at.interval[1]);
+  if (!pts.length) return null;
+  // minimum/maximum ALWAYS describe data values, independent of storage units.
+  const value = p => yCalibration?.ok ? yCalibration.toValue(p[1]) : -p[1];
   let best = pts[0];
   for (const p of pts) {
-    if (kind === "maximum" ? p[1] > best[1] : p[1] < best[1]) best = p;
+    if (kind === "maximum" ? value(p) > value(best) : value(p) < value(best)) best = p;
   }
   return { x: best[0], y: best[1] };
 }
@@ -64,26 +70,34 @@ export function evaluateRelations({ series, relations, yCalibration, coordinateS
 
   (relations || []).forEach((rel, i) => {
     const tag = rel.id || `relations[${i}]`;
+    const refs = [rel.seriesId, rel.aboveSeriesId, rel.belowSeriesId, rel.withSeriesId, rel.at?.seriesId].filter(Boolean);
+    if (refs.some(id => !byId.has(id))) {
+      if (opts.allowMissing) return;
+      const check = { tag, kind: rel.kind, ok:false, reason:'missing series reference' };
+      checks.push(check); failures.push(relationError('MISSING_SERIES', tag + ': missing series reference', check)); return;
+    }
+    const located = (s, at, kind) => extremumOf(s, at, kind, yCalibration);
+    const scaleY = 1000 / (opts.imageHeightPx || 1000);
     if (rel.kind === "vertical-order") {
       const above = byId.get(rel.aboveSeriesId);
       const below = byId.get(rel.belowSeriesId);
       if (!above || !below) return;
       const atKind = (rel.at && rel.at.kind === "maximum") ? "maximum" : "minimum";
-      const ex = extremumOf(below, rel.at, atKind);
-      if (!ex) return;
+      const ex = located(byId.get(rel.at?.seriesId) || below, rel.at, atKind);
+      if (!ex) { failures.push(relationError('MISSING_LOCATION', tag + ': extremum outside series domain', {tag})); return; }
       const yA = valueAt(above, ex.x, space, yCalibration);
       const yB = valueAt(below, ex.x, space, yCalibration);
       const margin = space === "data"
-        ? (Number(rel.marginValue) || 0)
-        : (Number(rel.marginPx) || opts.defaultMarginPx || 4);
+        ? (rel.marginValue != null ? Number(rel.marginValue) : Math.abs(yCalibration.toValue(0) - yCalibration.toValue((Number(rel.marginPx) || opts.defaultMarginPx || 4) * scaleY)))
+        : (rel.marginPx != null ? Number(rel.marginPx) : opts.defaultMarginPx || 4) * scaleY;
       const gap = space === "data" ? yA - yB : yB - yA;
       const ok = gap >= margin - 1e-9;
       const check = { tag, kind: "vertical-order", ok, gap, margin, x: ex.x, yBelow: yB, yAbove: yA, space };
       checks.push(check);
       if (!ok) {
         failures.push(relationError("VERTICAL_ORDER", [
-          `${below.id} ${atKind} is ${space === "data" ? "above" : "below"} ${above.id} by`,
-          `${Math.abs(gap).toFixed(1)} (needs at least ${margin}), near x=${(ex.x).toFixed(1)} in ${space} space`,
+          `${tag}: ${below.id} below ${above.id} gap=${gap.toFixed(3)}`,
+          `(requires >= ${margin.toFixed(3)}), at x=${ex.x.toFixed(1)} in ${space} space`,
         ].join(" "), check));
       }
       return;
@@ -93,7 +107,7 @@ export function evaluateRelations({ series, relations, yCalibration, coordinateS
       const s = byId.get(rel.seriesId);
       if (!s) return;
       const kind = (rel.at && rel.at.kind === "maximum") ? "maximum" : "minimum";
-      const ex = extremumOf(s, rel.at, kind);
+      const ex = located(byId.get(rel.at?.seriesId) || s, rel.at, kind);
       if (!ex) return;
       if (!yCalibration || !yCalibration.ok) {
         const check = { tag, kind: "axis-contact", ok: false, x: ex.x, y: ex.y, value: rel.value, reason: "y-axis not calibrated" };
@@ -101,7 +115,7 @@ export function evaluateRelations({ series, relations, yCalibration, coordinateS
         failures.push(relationError("AXIS_CONTACT", `cannot check ${s.id} ${kind}: y-axis calibration unavailable`, check));
         return;
       }
-      const actual = yCalibration.toValue(ex.y);
+      const actual = yCalibration.toValue(pointAt(s, ex.x));
       const tolerance = Number(rel.tolerance) || opts.axisTolerance || Math.max(0.02, (yCalibration.rmse || 0.5) * 2);
       const ok = Math.abs(actual - Number(rel.value)) <= tolerance;
       const check = { tag, kind: "axis-contact", ok, actual, expected: Number(rel.value), tolerance, x: ex.x, y: ex.y };
@@ -116,8 +130,24 @@ export function evaluateRelations({ series, relations, yCalibration, coordinateS
       const a = byId.get(rel.seriesId);
       const b = byId.get(rel.withSeriesId);
       if (!a || !b) return;
-      const check = { tag, kind: "crossing", ok: true, note: "crossing count checked by the sparse evidence" };
+      const lo = Math.max(a.points[0][0], b.points[0][0], rel.at?.interval?.[0] ?? -Infinity);
+      const hi = Math.min(a.points.at(-1)[0], b.points.at(-1)[0], rel.at?.interval?.[1] ?? Infinity);
+      const xs = [...new Set([...a.points, ...b.points].map(p => p[0]).concat(Array.from({length:129},(_,j)=>lo+(hi-lo)*j/128)))].filter(x => x>=lo && x<=hi).sort((x,y)=>x-y);
+      const roots = [];
+      const diff = x => pointAt(a,x)-pointAt(b,x);
+      const add = x => { if (!roots.some(r => Math.abs(r-x)<1e-4)) roots.push(x); };
+      for (let j=1;j<xs.length;j++) {
+        let l=xs[j-1], r=xs[j], dl=diff(l), dr=diff(r);
+        if (!Number.isFinite(dl) || !Number.isFinite(dr)) continue;
+        if (Math.abs(dl)<1e-7 && Math.abs(dr)<1e-7) continue; // overlap is not a distinct crossing
+        if (Math.abs(dl)<1e-7) add(l);
+        if (Math.abs(dr)<1e-7) add(r);
+        if (dl*dr<0) { for(let k=0;k<35;k++){ const m=(l+r)/2, dm=diff(m); if(dl*dm<=0)r=m;else{l=m;dl=dm;} } add((l+r)/2); }
+      }
+      const expected = Number(rel.count ?? rel.expectedCount ?? 1);
+      const check = { tag, kind: "crossing", ok: roots.length === expected, expected, actual:roots.length, xs:roots };
       checks.push(check);
+      if (!check.ok) failures.push(relationError('CROSSING_COUNT', tag + ': expected ' + expected + ' crossings, found ' + roots.length, check));
       return;
     }
 
@@ -125,10 +155,10 @@ export function evaluateRelations({ series, relations, yCalibration, coordinateS
       const a = byId.get(rel.seriesId);
       const b = byId.get(rel.withSeriesId);
       if (!a || !b) return;
-      const ea = extremumOf(a, rel.at, "minimum");
-      const eb = extremumOf(b, rel.at, "minimum");
+      const ea = located(a, rel.at, rel.at?.kind || 'minimum');
+      const eb = located(b, rel.at, rel.at?.kind || 'minimum');
       const dx = ea && eb ? Math.abs(ea.x - eb.x) : Infinity;
-      const tolerance = Number(rel.tolerancePx) || opts.extremumTolerancePx || 8;
+      const tolerance = (Number(rel.tolerancePx) || opts.extremumTolerancePx || 8) * 1000 / (opts.imageWidthPx || 1000);
       const ok = dx <= tolerance;
       const check = { tag, kind: "same-extremum", ok, dx, tolerance };
       checks.push(check);
@@ -153,6 +183,7 @@ export function relationFeedback(result) {
  */
 export function checkContinuity(series, options) {
   const opts = options || {};
+  if (isObservationSeries(series)) return { ok:true, gaps:[] };
   const pts = (series.points || []).slice().sort((a, b) => a[0] - b[0]);
   if (pts.length < 2) return { ok: true, gaps: [] };
   if (series.continuous === false || series.discontinuous === true) return { ok: true, gaps: [] };
