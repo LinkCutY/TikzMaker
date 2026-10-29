@@ -1,15 +1,27 @@
-/** Low-dimensional image likelihood. It optimises <=10 B-spline coefficients,
+/** Low-dimensional image likelihood. It optimises <=16 B-spline coefficients,
  * never follows contours, creates per-column points or emits raster samples. */
 import { monotoneCubics, sceneCurveBudgetOptions } from './scene.mjs';
 import { analyzeCurveBudget } from './curve-budget.mjs';
 import { fitPrintedMarkers } from './plot-observations.mjs';
 import { fitHollowMarkers } from './marker-fit.mjs';
 import { groundSceneAxes } from './scene-anchors.mjs';
+import { attachPlotFrames, refreshPlotCoordinates } from './plot-frame.mjs';
+import { structuralExtrema } from './curve-structure.mjs';
+import { roughnessMatrix, shapeConstraints, constrainedCoefficients } from './spline-constraints.mjs';
+import { fitStrokePattern, geometryLookup, dashVisibility, measureExtremum } from './stroke-evidence.mjs';
 
 const rgb=h=>/^#[0-9a-f]{6}$/i.test(h||'')?[1,3,5].map(i=>parseInt(h.slice(i,i+2),16)):null;
 const distance=(a,b)=>Math.hypot(...a.map((v,i)=>v-b[i]));
 const cubic=(a,b,c,d,t)=>(1-t)**3*a+3*(1-t)**2*t*b+3*(1-t)*t*t*c+t**3*d;
+function functionProxy(o){
+  const points=o.points||(o.start&&o.segments?[o.start,...o.segments.map(s=>s[2])]:[]);
+  if(points.length<2||points.some((p,i)=>i&&p[0]<=points[i-1][0]))return null;
+  const segments=o.segments||monotoneCubics(points);
+  if(segments.some((s,i)=>s[0][0]<points[i][0]-1e-8||s[1][0]<s[0][0]-1e-8||s[2][0]<s[1][0]-1e-8))return null;
+  return {...o,points,_segments:segments};
+}
 function priorCurve(o,x){
+  if(x<=o.points[0][0])return o.points[0][1];
   const i=o.points.findIndex((p,j)=>j&&x<=p[0]);if(i<1)return o.points.at(-1)[1];
   const a=o.points[i-1],s=o._segments[i-1];let lo=0,hi=1;
   for(let j=0;j<20;j++){const t=(lo+hi)/2;if(cubic(a[0],s[0][0],s[1][0],s[2][0],t)<x)lo=t;else hi=t;}
@@ -66,21 +78,26 @@ function solveOrdered(A,b,direction,start,fixed){
   }
   return x;
 }
-export function fitSplineEvidence(evidence,k,{ridge=.002,interior,monotone=0,weights,endpoints={}}={}){
+export function fitSplineEvidence(evidence,k,{ridge=.002,interior,monotone=0,weights,endpoints={},structure=null,unitScale=1,deadline=Infinity}={}){
   const fixed={};
   if(Number.isFinite(endpoints.start))fixed[0]=endpoints.start;
   if(Number.isFinite(endpoints.end))fixed[k-1]=endpoints.end;
   const knots=interior?[0,0,0,0,...interior,1,1,1,1]:knotsFor(k),rows=evidence.map(([x])=>basis(x,knots,k));let coeff=null;
+  if(knots.length!==k+4||knots.some((v,i)=>!Number.isFinite(v)||(i&&v<knots[i-1])))return null;
+  const roughness=roughnessMatrix(knots,k),constraints=shapeConstraints(knots,k,structure);
+  for(const [index,value] of Object.entries(fixed))constraints.eq.push({row:Array.from({length:k},(_,i)=>i===Number(index)?1:0),rhs:value});
   for(let iteration=0;iteration<4;iteration++){
+    if(Date.now()>deadline)return null;
     const A=Array.from({length:k},()=>Array(k).fill(0)),b=Array(k).fill(0);
     for(let n=0;n<rows.length;n++){
       const row=rows[n],y=evidence[n][1];
       const residual=coeff?Math.abs(row.reduce((s,v,i)=>s+v*coeff[i],0)-y):0;
-      const weight=(weights?.[n]??1)*(residual>4?4/residual:1);
+      const robustLimit=4/unitScale;
+      const weight=(weights?.[n]??1)*(residual>robustLimit?robustLimit/residual:1);
       for(let i=0;i<k;i++){b[i]+=weight*row[i]*y;for(let j=0;j<k;j++)A[i][j]+=weight*row[i]*row[j];}
     }
     for(let i=0;i<k;i++)A[i][i]+=1e-7;
-    for(let i=0;i<k-2;i++)for(let a=0;a<3;a++)for(let c=0;c<3;c++)A[i+a][i+c]+=ridge*evidence.length*[1,-2,1][a]*[1,-2,1][c];
+    for(let i=0;i<k;i++)for(let j=0;j<k;j++)A[i][j]+=ridge*evidence.length*roughness[i][j];
     // Clamped B-spline endpoint coefficients equal f(0), f(1). Eliminate them
     // exactly instead of a soft loss penalty that can drift during regression.
     for(const [index,value] of Object.entries(fixed)){
@@ -89,7 +106,7 @@ export function fitSplineEvidence(evidence,k,{ridge=.002,interior,monotone=0,wei
       A[j][j]=1;b[j]=value;
     }
     const unconstrained=solve(A,b);if(!unconstrained)return null;
-    coeff=monotone?solveOrdered(A,b,monotone,coeff||unconstrained,fixed):unconstrained;if(!coeff)return null;
+    coeff=structure?constrainedCoefficients(A,b,constraints.eq,constraints.ineq,solve):monotone?solveOrdered(A,b,monotone,coeff||unconstrained,fixed):unconstrained;if(!coeff)return null;
   }
   const value=x=>basis(x,knots,k).reduce((s,v,i)=>s+v*coeff[i],0);
   const rmse=Math.sqrt(evidence.reduce((s,[x,y])=>s+(value(x)-y)**2,0)/evidence.length);
@@ -107,6 +124,18 @@ function splineGeometry(fit,lo,hi,height){
     segments.push([[p[0]+dx,(2*r-s)/18],[q[0]-dx,(2*s-r)/18],q]);
   }
   return {start:pt(0),segments};
+}
+
+function fittedExtrema(fit){
+  const g=splineGeometry(fit,0,1,1000),events=[];let p=g.start;
+  for(const s of g.segments){
+    const y=[p[1],...s.map(q=>q[1])],a=-y[0]+3*y[1]-3*y[2]+y[3],b=3*y[0]-6*y[1]+3*y[2],c=3*(y[1]-y[0]),roots=[];
+    if(Math.abs(a)<1e-10){if(Math.abs(b)>1e-10)roots.push(-c/(2*b));}
+    else {const d=4*b*b-12*a*c;if(d>=0)roots.push((-2*b-Math.sqrt(d))/(6*a),(-2*b+Math.sqrt(d))/(6*a));}
+    for(const u of roots)if(u>1e-6&&u<1-1e-6){const t=p[0]+u*(s[2][0]-p[0]);
+      events.push({t,kind:6*a*u+2*b<0?'maximum':'minimum',yPx:fit.value(t),tolerancePx:2,observation:{source:'image-supported-spline',inferred:true}});
+    }p=s[2];
+  }return events.sort((a,b)=>a.t-b.t);
 }
 
 function monotoneDirection(o,height){
@@ -197,17 +226,18 @@ export function compactSceneCurves(scene,height){
   })};
 }
 
-function fitSmooth(raster,o,objects){
-  const reject=(reason,details={})=>({...o,fitDiagnostics:{status:'kept-model',reason,...details}});
+function fitSmooth(raster,o,objects,frame,deadline=Infinity){
+  const reject=(reason,details={})=>({...o,fitDiagnostics:{status:'kept-model',reason,requiresReview:true,...details}});
+  if(Date.now()>deadline)return reject('fit-time-budget');
   const color=rgb(o.style.stroke);if(!color||o.closed)return reject('unsupported-colour-or-closed-path');
   const gray=Math.max(...color)-Math.min(...color)<35;
-  if(gray&&(Math.min(...color)<45||Math.max(...color)>200))return reject('axis-like-grey');
+  if(gray&&(Math.min(...color)<45||Math.max(...color)>200)&&o.role!=='data'&&!objects.some(q=>q.kind==='legend'&&q.entries.some(e=>e.seriesId===o.id)))return reject('axis-like-grey');
   const lo=o.points[0][0],hi=o.points.at(-1)[0];if(hi-lo<80)return reject('domain-too-short');
-  const conflict=objects.some(other=>{
+  const competitors=objects.filter(other=>{
     const points=other.points||(other.start&&other.segments?[other.start,...other.segments.map(s=>s[2])]:[]);
-    return other.id!==o.id&&other.kind==='path'&&points.length>=2&&rgb(other.style?.stroke)&&distance(color,rgb(other.style.stroke))<45&&Math.min(hi,Math.max(...points.map(p=>p[0])))-Math.max(lo,Math.min(...points.map(p=>p[0])))>20;
+    return other.id!==o.id&&other.kind==='path'&&['smooth','bezier'].includes(other.connection)&&!other.closed&&other.frameId===o.frameId&&points.length>=2&&rgb(other.style?.stroke)&&distance(color,rgb(other.style.stroke))<45&&Math.min(hi,Math.max(...points.map(p=>p[0])))-Math.max(lo,Math.min(...points.map(p=>p[0])))>20;
   });
-  if(conflict)return reject('ambiguous-same-colour-series');
+  if(competitors.length>8)return reject('dense-same-colour-family-needs-shared-template',{competitors:competitors.length});
   const {w,h}=raster,prior={...o,_segments:o._segments||monotoneCubics(o.points)},data=[];
   const minY=Math.min(...o.points.map(p=>p[1]))*h/1000,maxY=Math.max(...o.points.map(p=>p[1]))*h/1000;
   const direction=[color[0]-color[1],color[2]-color[1]],norm=Math.hypot(...direction);
@@ -215,39 +245,109 @@ function fitSmooth(raster,o,objects){
     const x=q.at[0]/1000*w,y=q.at[1]/1000*h,fs=q.fontSize??12;
     return [x-4,y-fs,(q.swatchWidth??25)+12+Math.max(...q.entries.map(e=>e.text.length))*fs*.6,(q.rowHeight??fs*1.65)*q.entries.length+fs];
   });
+  for(const q of objects.filter(q=>q.kind==='text')){
+    const fs=q.fontSize||12,x=q.at[0]*w/1000,y=q.at[1]*h/1000;
+    excluded.push([x-fs*q.text.length*.3,y-fs*.65,fs*q.text.length*.6,fs*1.3]);
+  }
+  const excludedLines=objects.filter(q=>q.kind==='path'&&['axis','tick','grid','reference'].includes(q.role)&&q.connection==='linear'&&q.points?.length===2)
+    .map(q=>({points:q.points.map(p=>[p[0]*w/1000,p[1]*h/1000]),radius:(q.style.width||1)/2+1}));
+  const hypotheses=[o,...competitors].map(q=>{
+    const proxy=functionProxy(q);if(!proxy)return null;
+    const points=proxy.points,a=points[0][0]*w/1000,b=points.at(-1)[0]*w/1000;
+    const value=t=>priorCurve(proxy,(a+t*(b-a))*1000/w)*h/1000;
+    const pattern=fitStrokePattern(raster,color,value,a,b,{dashed:['dashed','dotted'].includes(q.style.dash),dotted:q.style.dash==='dotted',width:q.style.width||1,excluded});
+    return {id:q.id,lookup:geometryLookup(value,a,b),pattern};
+  }).filter(Boolean);
+  const dashed=['dashed','dotted'].includes(o.style.dash),own=hypotheses.find(q=>q.id===o.id);
+  let ambiguous=0;
   for(let y=Math.max(0,Math.floor(minY-h*.28));y<=Math.min(h-1,maxY+h*.28);y++)for(let x=Math.max(0,Math.ceil(lo*w/1000));x<=Math.min(w-1,hi*w/1000);x++){
+    if((x&255)===0&&(y&31)===0&&Date.now()>deadline)return reject('fit-time-budget');
     const j=(y*w+x)*3,p=raster.rgb.subarray(j,j+3),c=[p[0]-p[1],p[2]-p[1]],n=Math.hypot(...c);
     if(gray ? distance(color,p)>24 : n<35||(c[0]*direction[0]+c[1]*direction[1])/(n*norm)<.99)continue;
     if(excluded.some(([a,b,c,d])=>x>=a&&x<=a+c&&y>=b&&y<=b+d))continue;
+    if(excludedLines.some(({points:[a,b],radius})=>{
+      const dx=b[0]-a[0],dy=b[1]-a[1],length=dx*dx+dy*dy;
+      const t=length?Math.max(0,Math.min(1,((x-a[0])*dx+(y-a[1])*dy)/length)):0;
+      return Math.hypot(x-a[0]-t*dx,y-a[1]-t*dy)<=radius;
+    }))continue;
+    if(frame){const [a,b,fw,fh]=frame.box;if(x<a||x>a+fw||y<b||y>b+fh)continue;}
     const nx=x/w*1000;
     // For an isolated chromatic series the prior is what we want to CORRECT.
     // Hard rejection around it discarded real steep transitions when the model
     // guessed their location incorrectly. Grey evidence still needs this guard.
     if(gray&&Math.abs(y-priorCurve(prior,nx)*h/1000)>Math.max(25,h*.28))continue;
-    data.push([(nx-lo)/(hi-lo),y]);
+    let ownership=1;
+    if(hypotheses.length>1){
+      const sigma=Math.max(4,h*.025),scores=hypotheses.map(q=>{
+        const p=q.lookup(x);if(!p)return 0;
+        return Math.exp(-(((y-p.y)/sigma)**2)/2)*(dashVisibility(p.s,q.pattern)?1:.15);
+      }),sum=scores.reduce((s,v)=>s+v,0),index=hypotheses.findIndex(q=>q.id===o.id);
+      ownership=sum>1e-12?scores[index]/sum:0;
+      if(ownership<.65){ambiguous++;continue;}
+    }
+    data.push([(nx-lo)/(hi-lo),y,ownership]);
   }
   if(data.length<35)return reject('insufficient-colour-evidence',{terms:data.length});
   // Bounded quadrature per broad interval, NOT per-column curve extraction.
   // Never turn these image residual terms into vertices or output landmarks.
   const groups=Array.from({length:24},()=>[]);for(const p of data)groups[residualBin(p[0])].push(p);
   const evidence=groups.flatMap(g=>g.length<=90?g:Array.from({length:90},(_,i)=>g[Math.floor((i+.5)*g.length/90)]));
-  const coverage=new Set(evidence.map(([x])=>Math.min(19,Math.floor(x*20))));if(coverage.size<16)return reject('incomplete-domain-evidence',{coveredBins:coverage.size,totalBins:20});
-  // Hold out source columns, not adjacent antialiasing pixels from one stroke.
-  const heldOut=([x])=>Math.round((lo+x*(hi-lo))*w/1000)%5===0;
+  const coverage=new Set(evidence.map(([x])=>Math.min(19,Math.floor(x*20))));
+  if(coverage.size<(dashed?6:16))return reject('incomplete-domain-evidence',{coveredBins:coverage.size,totalBins:20});
+  // Whole predicted dashes (when identified), otherwise contiguous domain blocks.
+  const heldOut=([t])=>{
+    const p=own?.lookup((lo+t*(hi-lo))*w/1000),pattern=own?.pattern;
+    return dashed&&pattern?.reliable&&p?Math.floor((p.s+pattern.phase)/pattern.period)%4===1:Math.min(11,Math.floor(t*12))%3===1;
+  };
   const train=evidence.filter(p=>!heldOut(p)),test=evidence.filter(heldOut);
   if(train.length<25||test.length<12)return reject('insufficient-held-out-evidence');
   const before=fitMetrics(test,x=>priorCurve(prior,lo+x*(hi-lo))*h/1000);
-  const weights=balancedWeights(train),monotone=monotoneDirection(o,h);
+  const weights=balancedWeights(train).map((v,i)=>v*(train[i][2]??1)),monotone=monotoneDirection(o,h);
   const endpoints={};
   if(o.endpointAnchors?.start)endpoints.start=o.endpointAnchors.start.at[1]*h/1000;
   if(o.endpointAnchors?.end)endpoints.end=o.endpointAnchors.end.at[1]*h/1000;
   const fits=[];
+  const sourcePoints=o.fit?.priorPoints||o.points;
+  const events=structuralExtrema(sourcePoints.map(p=>[p[0],p[1]*h/1000]),Math.max(2,(o.style.width||1)*1.5)).map(e=>{
+    const i=e.index,a=sourcePoints[i-1],b=sourcePoints[i],c=sourcePoints[i+1];
+    const left=Math.atan2((b[1]-a[1])*h,(b[0]-a[0])*w),right=Math.atan2((c[1]-b[1])*h,(c[0]-b[0])*w);
+    const smooth=Math.abs(right-left)<Math.PI/3,px=p=>[p[0]*w/1000,p[1]*h/1000];
+    const estimate=smooth&&!dashed&&!competitors.length?measureExtremum(raster,color,px(a),px(b),px(c),{width:o.style.width||1,excluded}):null;
+    const measurement=estimate&&estimate.sigmaX<=1.5&&estimate.sigmaY<=3?estimate:null;
+    const x=measurement?measurement.x*1000/w:e.x,y=measurement?.y??e.y;
+    return {...e,x,y,t:(x-lo)/(hi-lo),tolerance:measurement?Math.max(2,2*measurement.sigmaY):Math.max(3,(o.style.width||1)*2),smooth,
+      observation:measurement?{source:measurement.source,confidence:measurement.score,covariancePx:[[measurement.sigmaX**2,0],[0,measurement.sigmaY**2]]}: {source:'model-landmark',inferred:true}};
+  }).filter(e=>e.t>1e-5&&e.t<1-1e-5);
+  const boundaries=[{t:0,y:sourcePoints[0][1]*h/1000},...events,{t:1,y:sourcePoints.at(-1)[1]*h/1000}];
+  const intervals=events.length?boundaries.slice(1).map((b,i)=>({lo:boundaries[i].t,hi:b.t,sign:Math.sign(b.y-boundaries[i].y)})):
+    monotone?[{lo:0,hi:1,sign:monotone}]:[];
+  const structuralKnots=events.flatMap(e=>Array(e.smooth?1:3).fill(e.t));
+  const yBottom=frame?frame.box[1]+frame.box[3]:h,yScale=frame?.box[3]||h;
+  const toY=y=>(yBottom-y)/yScale,fromY=v=>yBottom-v*yScale;
+  const normalizedStructure={events:events.map(e=>({...e,y:toY(e.y),tolerance:e.tolerance/yScale})),intervals:intervals.map(s=>({...s,sign:-s.sign}))};
+  const normalizedEndpoints=Object.fromEntries(Object.entries(endpoints).map(([key,y])=>[key,toY(y)]));
+  function candidate(interior,relaxed=false){
+    if(Date.now()>deadline)return null;
+    interior=interior.slice().sort((a,b)=>a-b);const k=interior.length+4;if(k>16)return null;
+    const fit=fitSplineEvidence(train.map(([t,y])=>[t,toY(y)]),k,{ridge:1e-8,interior,weights,
+      endpoints:normalizedEndpoints,structure:relaxed?{events:normalizedStructure.events.filter(e=>e.observation?.source==='finite-quadratic-window'),intervals:[]}:normalizedStructure,unitScale:yScale,deadline});
+    if(!fit)return null;
+    const uvValue=fit.value,value=t=>fromY(uvValue(t));
+    return {...fit,uvValue,value,metrics:fitMetrics(test,value),interior,relaxed};
+  }
   // Nonuniform knot candidates capture endpoint boundary layers and knees.
   // Parameter count stays fixed; knots are mathematical templates, not pixels.
   for(const k of [4,6,8,10])for(const power of k===4?[1]:[.35,1,3]){
-    const interior=Array.from({length:k-4},(_,i)=>((i+1)/(k-3))**power);
-    const f=fitSplineEvidence(train,k,{ridge:0.00002,interior,weights,monotone,endpoints});
-    if(f)fits.push({...f,metrics:fitMetrics(test,f.value)});
+    const interior=[...structuralKnots,...Array.from({length:Math.max(0,k-4-structuralKnots.length)},(_,i)=>((i+1)/(Math.max(0,k-4-structuralKnots.length)+1))**power).filter(t=>!events.some(e=>Math.abs(e.t-t)<.015))];
+    const f=candidate(interior);if(f)fits.push(f);
+  }
+  // Model-read extrema are hypotheses, not measured equalities. If they
+  // contradict source evidence, compare a source-driven candidate rather than
+  // forbidding a missing dip/recovery forever. Verified endpoint anchors remain.
+  if(before.rmse>4&&(!fits.length||Math.min(...fits.map(f=>f.metrics.rmse))>3)){
+    for(const k of [6,10,14])for(const power of [.35,1,3]){
+      const f=candidate(Array.from({length:k-4},(_,i)=>((i+1)/(k-3))**power),true);if(f)fits.push(f);
+    }
   }
   // A flat-to-changing transition can be a genuine C0 knee. A triple knot
   // permits that without forcing every curve into a sigmoid or exponential.
@@ -259,11 +359,25 @@ function fitSmooth(raster,o,objects){
   }
   for(const knee of knees.slice(0,2))for(const shift of [-.02,-.01,0,.01,.02]){
     const t=Math.max(.005,Math.min(.995,knee+shift));
-    const interior=[t,t,t,...[.25,.5,.75].map(u=>t<=.5?t+(1-t)*u*u:t*(1-u*u))].sort((a,b)=>a-b);
-    const f=fitSplineEvidence(train,10,{ridge:0.00002,interior,weights,monotone,endpoints});
-    if(f)fits.push({...f,metrics:fitMetrics(test,f.value)});
+    if(structuralKnots.some(u=>Math.abs(u-t)<.01))continue;
+    const interior=[...structuralKnots,t,t,t,...[.25,.5,.75].map(u=>t<=.5?t+(1-t)*u*u:t*(1-u*u))];
+    const f=candidate(interior);if(f)fits.push(f);
   }
   const loss=f=>f.metrics.rmse**2+.5*f.metrics.worst**2+.12*f.k;
+  // Refine only intervals with independent evidence and validation improvement.
+  let adaptive=fits.slice().sort((a,b)=>loss(a)-loss(b))[0];
+  for(let iteration=0;adaptive&&adaptive.k<16&&iteration<6;iteration++){
+    const bins=Array.from({length:24},()=>({sum:0,n:0}));
+    for(const [t,y] of train){const b=bins[residualBin(t)];b.sum+=(adaptive.value(t)-y)**2;b.n++;}
+    const ranked=bins.map((b,i)=>({...b,t:(i+.5)/24,error:b.n>=5?b.sum/b.n:0})).sort((a,b)=>b.error-a.error);
+    let next=null;
+    for(const b of ranked.slice(0,3)){
+      if(b.error<2.25||adaptive.interior.some(t=>Math.abs(t-b.t)<.02))continue;
+      const f=candidate([...adaptive.interior,b.t],adaptive.relaxed);
+      if(f&&loss(f)<loss(adaptive)*.98&&f.metrics.worst<=adaptive.metrics.worst*1.05&&(!next||loss(f)<loss(next)))next=f;
+    }
+    if(!next)break;fits.push(next);adaptive=next;
+  }
   fits.sort((a,b)=>loss(a)-loss(b));
   const tolerance=Math.max(2.5,(o.style.width??1)*1.5);
   // A low combined score must not hide a failed hard local-error gate when
@@ -277,23 +391,40 @@ function fitSmooth(raster,o,objects){
     best.metrics.rmse<before.rmse*.85&&best.metrics.worst<=Math.max(tolerance,before.worst);
   let provisional=false;
   if(!strict){
-    const improved=fits.find(f=>f.metrics.rmse<=tolerance&&f.metrics.worst<=Math.max(10,tolerance*2.5)&&
-      f.metrics.rmse<before.rmse*.5&&f.metrics.worst<before.worst*.5);
+    const improved=fits.find(f=>f.metrics.rmse<=Math.max(8,tolerance*2)&&f.metrics.worst<=Math.max(16,tolerance*3)&&
+      f.metrics.rmse<before.rmse*.6&&f.metrics.worst<before.worst*.8);
     if(improved){best=improved;provisional=true;}
   }
-  const diagnostics={terms:evidence.length,monotone,before,best:best?{...best.metrics,parameters:best.k}:null};
+  const diagnostics={terms:evidence.length,monotone:events.length?'piecewise':monotone,structure:events.map(e=>({t:e.t,kind:e.kind,yPx:e.y,tolerancePx:e.tolerance,observation:e.observation})),
+    ownership:{competitors:competitors.map(q=>q.id),ambiguousTerms:ambiguous},frameId:frame?.id,before,best:best?{...best.metrics,parameters:best.k}:null};
+  if(before.rmse<=tolerance&&before.worst<=Math.max(4,tolerance*1.5)&&own?.pattern?.reliable&&
+      (!best||best.metrics.rmse>=before.rmse*.85))return {...o,fitDiagnostics:{...diagnostics,status:'verified',requiresReview:false,stroke:own.pattern}};
   if(!best||!provisional&&(best.metrics.rmse>tolerance||best.metrics.worst>Math.max(4,tolerance*1.5)))return reject('local-or-global-error-too-large',diagnostics);
   if(best.metrics.rmse>=before.rmse*.85||best.metrics.worst>Math.max(tolerance,before.worst))return reject('no-reliable-improvement',diagnostics);
+  const pattern=fitStrokePattern(raster,color,best.value,lo*w/1000,hi*w/1000,{dashed,dotted:o.style.dash==='dotted',width:o.style.width||1,excluded});
+  if(!pattern.reliable)provisional=true;
+  if(own?.pattern?.reliable&&pattern.loss>own.pattern.loss+.08)return reject('stroke-likelihood-regressed',{...diagnostics,stroke:pattern});
   const geometry=splineGeometry(best,lo,hi,h);
+  if(best.relaxed){diagnostics.modelStructure=diagnostics.structure;diagnostics.structure=fittedExtrema(best);diagnostics.priorShapeRejected=true;}
   if([geometry.start,...geometry.segments.flat()].flat().some(v=>!Number.isFinite(v)||v< -50||v>1050))return reject('fitted-geometry-out-of-bounds',diagnostics);
-  return {...o,connection:'bezier',...geometry,points:undefined,fitDiagnostics:{status:provisional?'provisional':'fitted',requiresReview:provisional,...diagnostics},fit:{method:'bounded-cubic-regression',coordinateSpace:'image-normalised',parameters:best.k,rmsePx:best.metrics.rmse,worstBinRmsePx:best.metrics.worst,beforeRmsePx:before.rmse,monotone,endpointConstraintsPx:endpoints,priorPoints:o.points}};
+  const dashOn=o.style.dash==='dotted'?0:Math.max(.1,pattern.on-(o.style.width||1));
+  const style=dashed&&pattern.reliable?{...o.style,dashOn,dashOff:pattern.period-dashOn,
+    dashPhase:((pattern.phase-(o.style.width||1)/2)%pattern.period+pattern.period)%pattern.period}:o.style;
+  return {...o,connection:'bezier',...geometry,points:undefined,style,
+    fitDiagnostics:{status:provisional?'provisional':'fitted',requiresReview:provisional,...diagnostics,stroke:pattern},
+    fit:{method:'adaptive-constrained-cubic',coordinateSpace:frame?'plot-uv':'image-uv',frameId:frame?.id,
+      coefficients:best.coeff,knots:best.knots,domainU:frame?[(lo*w/1000-frame.box[0])/frame.box[2],(hi*w/1000-frame.box[0])/frame.box[2]]:[lo/1000,hi/1000],
+      parameters:best.k,rmsePx:best.metrics.rmse,worstBinRmsePx:best.metrics.worst,beforeRmsePx:before.rmse,monotone,
+      endpointConstraintsPx:endpoints,priorPoints:sourcePoints,stroke:pattern}};
 }
 
 export function refineScene(scene,raster){
-  scene=groundSceneAxes(scene,raster);
+  const deadline=Date.now()+15000;
+  scene=attachPlotFrames(groundSceneAxes(scene,raster),raster);
+  const frames=new Map((scene.plotFrames||[]).map(f=>[f.id,f]));
   const objects=scene.objects.map(o=>structuredClone(o));
   const refined=objects.map(o=>{
-    if(o.kind!=='path')return o;
+    if(o.kind!=='path'||o.style?.arrow||['axis','tick','grid','reference','annotation'].includes(o.role))return o;
     // Only an isolated horizontal ring series has unambiguous projection
     // ownership. Other hollow shapes stay model-read until independently fitted.
     if(o.marker?.filled===false&&o.marker?.shape==='circle'&&o.connection==='linear'&&o.points?.length===2&&Math.abs(o.points[0][1]-o.points[1][1])<10){
@@ -303,13 +434,15 @@ export function refineScene(scene,raster){
         const fit=fitHollowMarkers(raster,o,excluded);if(fit.fit)return fit;
       }
     }
-    if((o.connection==='smooth'||o.connection==='bezier')&&!o.closed&&!o.marker?.points&&(!o.marker||o.marker.shape==='none')){
-      const proxy=o.connection==='bezier'?{...o,points:[o.start,...o.segments.map(s=>s[2])],_segments:o.segments}:o;
-      if(proxy.points?.length>=2 && proxy.points.every((p,i)=>!i||p[0]>proxy.points[i-1][0])){
-        const fit=fitSmooth(raster,proxy,objects);
+    if((scene.type==='plot'||o.frameId||o.role==='data'||objects.some(q=>q.kind==='legend'&&q.entries.some(e=>e.seriesId===o.id)))&&
+      (o.connection==='smooth'||o.connection==='bezier')&&!o.closed&&!o.marker?.points&&(!o.marker||o.marker.shape==='none')){
+      const proxy=functionProxy(o);
+      if(proxy){
+        const fit=fitSmooth(raster,proxy,objects,frames.get(o.frameId),Math.min(deadline,Date.now()+2500));
         if(['fitted','provisional'].includes(fit.fitDiagnostics?.status)){delete fit._segments;return fit;}
         if(fit.fitDiagnostics)return {...o,fitDiagnostics:fit.fitDiagnostics};
       }
+      return {...o,fitDiagnostics:{status:'kept-model',requiresReview:true,reason:'parametric-curve-needs-separate-fit'}};
     }
     if(o.marker?.shape==='circle'&&o.marker.filled!==false&&['linear','none'].includes(o.connection)&&o.points?.length>=2){
       const color=rgb(o.style.stroke);if(!color)return o;
@@ -321,5 +454,19 @@ export function refineScene(scene,raster){
       if(fitted.markerFit)return {...o,points:fitted.points,marker:fitted.marker,expectedMarkers:fitted.points.length,fit:fitted.markerFit};
     }
     return o;
-  });return {...scene,objects:refined};
+  });
+  // Simultaneous updates keep same-colour ownership independent of object order.
+  // Two bounded reassignment passes; no pixel tracks or ever-growing vertices.
+  let current=refined;
+  for(let round=0;round<2;round++){
+    let changed=false;
+    const next=current.map(o=>{
+      if(!o.fitDiagnostics?.ownership?.competitors?.length||!['smooth','bezier'].includes(o.connection))return o;
+      const proxy=functionProxy(o);if(!proxy)return o;
+      const fit=fitSmooth(raster,proxy,current,frames.get(o.frameId),Math.min(deadline,Date.now()+1500));
+      if(['fitted','provisional'].includes(fit.fitDiagnostics?.status)){changed=true;delete fit._segments;return fit;}
+      return o;
+    });current=next;if(!changed)break;
+  }
+  return refreshPlotCoordinates({...scene,objects:current},raster);
 }

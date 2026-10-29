@@ -2,9 +2,10 @@
  * this compiler. There is no raster-to-path or dense contour fallback. */
 import { safeNodeText, cjkPreamble } from './textext.mjs';
 import { CURVE_BUDGET, CURVE_BUDGET_PROMPT } from './curve-budget.mjs';
+import { clipCubics } from './curve-clip.mjs';
 export { analyzeCurveBudget, pathBudget } from './curve-budget.mjs';
 
-export const SCENE_LIMITS={objects:260,paths:60,labels:160,smoothPoints:CURVE_BUDGET.maxPoints,corners:80,markers:100,segments:10};
+export const SCENE_LIMITS={objects:260,paths:60,labels:160,smoothPoints:CURVE_BUDGET.maxPoints,corners:80,markers:100,segments:24};
 export const KEYPOINT_SPACING = CURVE_BUDGET.spacing;
 export const CORNER_DEGREES = CURVE_BUDGET.cornerDegrees;
 
@@ -47,11 +48,13 @@ const rgb=c=>'{rgb,255:red,'+parseInt(c.slice(1,3),16)+';green,'+parseInt(c.slic
 export function sceneFromPixels(input,width,height){
   if(input.canvas?.unit!=='px'||input.canvas.width!==width||input.canvas.height!==height)throw new Error('canvas must declare exact source width, height and unit=px');
   const scene=structuredClone(input),p=q=>[q[0]/width*1000,q[1]/height*1000];
+  if(scene.relations)scene.relations=scene.relations.map(r=>({...r,at:r.at?p(r.at):r.at}));
   for(const o of scene.objects||[]){
     if(o.at)o.at=p(o.at);if(o.start)o.start=p(o.start);
     if(o.points)o.points=o.points.map(p);if(o.segments)o.segments=o.segments.map(s=>s.map(p));
     if(o.upper)o.upper=o.upper.map(p);if(o.lower)o.lower=o.lower.map(p);
     if(o.marker?.points)o.marker.points=o.marker.points.map(p);
+    if(o.endpointAnchors)for(const anchor of Object.values(o.endpointAnchors))if(anchor.at)anchor.at=p(anchor.at);
     if(o.box)o.box=[o.box[0]/width*1000,o.box[1]/height*1000,o.box[2]/width*1000,o.box[3]/height*1000];
   }
   scene.canvas={width:1000,height:1000,unit:'normalised'};
@@ -60,7 +63,9 @@ export function sceneFromPixels(input,width,height){
 }
 export function sceneToPixels(input,width,height){
   const scene=structuredClone(input),p=q=>[q[0]*width/1000,q[1]*height/1000];
+  if(scene.relations)scene.relations=scene.relations.map(r=>({...r,at:r.at?p(r.at):r.at}));
   for(const o of scene.objects||[]){if(o.at)o.at=p(o.at);if(o.start)o.start=p(o.start);if(o.points)o.points=o.points.map(p);if(o.segments)o.segments=o.segments.map(s=>s.map(p));if(o.upper)o.upper=o.upper.map(p);if(o.lower)o.lower=o.lower.map(p);if(o.marker?.points)o.marker.points=o.marker.points.map(p);if(o.box)o.box=[o.box[0]*width/1000,o.box[1]*height/1000,o.box[2]*width/1000,o.box[3]*height/1000];}
+  for(const o of scene.objects||[])if(o.endpointAnchors)for(const anchor of Object.values(o.endpointAnchors))if(anchor.at)anchor.at=p(anchor.at);
   scene.canvas={width,height,unit:'px'};return scene;
 }
 export function sceneCurveBudgetOptions(scene,object){
@@ -79,6 +84,8 @@ export function validateScene(input){
     o.style ||= {};
     for(const key of ['stroke','fill'])if(o.style[key]!=null && o.style[key]!=='none'&&!colour(o.style[key]))bad('invalid '+key+' colour');
     if(o.style.width!=null&&(!finite(o.style.width)||o.style.width<0||o.style.width>20))bad('width must be source pixels');
+    for(const key of ['dashOn','dashOff','dashPhase'])if(o.style[key]!=null&&(!finite(o.style[key])||o.style[key]<0||o.style[key]>10000))bad('invalid '+key);
+    if(o.style.dashOff===0&&o.style.dashOn===0)bad('dash period must be positive');
     if(o.kind==='text'){
       labels++;
       if(!xy(o.at)||typeof o.text!=='string'||!o.text.trim())bad('text and finite centre required');
@@ -122,6 +129,8 @@ export function validateScene(input){
   }
   if(labels>SCENE_LIMITS.labels||paths>SCENE_LIMITS.paths)errors.push('Label/path budget exceeded');
   for(const o of scene.objects)if(o.kind==='legend')for(const e of o.entries||[])if(!seen.has(e.seriesId)||typeof e.text!=='string')errors.push(o.id+': dangling legend reference '+e.seriesId);
+  if(scene.relations!=null&&!Array.isArray(scene.relations))errors.push('relations must be an array');
+  else for(const r of scene.relations||[])if(r.kind!=='crossing'||!xy(r.at)||!Array.isArray(r.seriesIds)||r.seriesIds.length!==2||r.seriesIds[0]===r.seriesIds[1]||r.seriesIds.some(id=>!seen.has(id)))errors.push('invalid crossing relation');
   return {ok:!errors.length,errors,scene};
 }
 
@@ -146,6 +155,7 @@ export function compileScene(input,{width,height,widthCm=16}={}){
     if(colour(s.fill))opts.push('fill='+rgb(s.fill));
     if(s.dash==='dashed')opts.push('dash pattern=on '+f((s.dashOn??5)*pt)+'pt off '+f((s.dashOff??3)*pt)+'pt');
     if(s.dash==='dotted')opts.push('dash pattern=on 0pt off '+f((s.dashOff??4)*pt)+'pt');
+    if(['dashed','dotted'].includes(s.dash)&&s.dashPhase!=null)opts.push('dash phase='+f(s.dashPhase*pt)+'pt');
     if(s.opacity!=null)opts.push('opacity='+f(Math.max(0,Math.min(1,s.opacity))));
     if(s.arrow==='end')opts.push('-{Stealth}');else if(s.arrow==='both')opts.push('{Stealth}-{Stealth}');
     return opts.join(',');
@@ -199,6 +209,13 @@ export function compileScene(input,{width,height,widthCm=16}={}){
     let body='';
     if(o.connection==='bezier'||o.connection==='smooth'){
       const start=o.start||o.points[0],segments=o.segments||monotoneCubics(o.points);
+      const frame=scene.plotFrames?.find(f=>f.id===o.frameId);
+      if(frame&&!o.closed&&!o.style?.arrow&&!['axis','tick','annotation'].includes(o.role)){
+        const box=frame.box.map((v,i)=>v/(i%2?height:width)*1000),result=clipCubics(start,segments,box);
+        for(const part of result.paths)lines.push('\\draw['+style(o.style)+'] '+p(part.start)+part.segments.map(s=>' .. controls '+p(s[0])+' and '+p(s[1])+' .. '+p(s[2])).join('')+';');
+        if(o.marker?.shape&&o.marker.shape!=='none')for(const at of o.marker.points||o.points||[])if(at[0]>=box[0]&&at[0]<=box[0]+box[2]&&at[1]>=box[1]&&at[1]<=box[1]+box[3])marker(at,o.marker,o.style);
+        continue;
+      }
       body=p(start)+segments.map(s=>' .. controls '+p(s[0])+' and '+p(s[1])+' .. '+p(s[2])).join('');
     }else if(o.connection!=='none'){
       let pts=o.points;
@@ -214,8 +231,9 @@ export function compileScene(input,{width,height,widthCm=16}={}){
 }
 
 export const SCENE_PROMPT=`Reconstruct the image as a compact editable semantic vector scene. Do NOT trace pixels. Return ONLY valid JSON. ALL coordinates and sizes are SOURCE IMAGE PIXELS, origin top-left, y DOWN. Do NOT normalise coordinates to 0..1000. Preserve aspect, exact relative placements, every readable text, style, series, legend, panels, fills and visible observation marker. Do not force everything into a smooth y(x) plot. No raw TikZ.
-For smooth paths with clear shape evidence, add "shape":{"monotone":"increasing|decreasing|none"}. This describes IMAGE y as x increases: a visually rising curve is decreasing. Use none for genuine peaks/valleys/oscillations; do not infer monotonicity just from its two endpoints. Preserve flat prefixes, sharp onsets, plateau heights and tails as separate semantic landmarks. A larger landmark budget does not excuse inaccurate positions.
-Schema: {"canvas":{"width":EXACT_IMAGE_WIDTH,"height":EXACT_IMAGE_HEIGHT,"unit":"px"},"type":"plot|diagram|table|regions|mixed|geometry","summary":"short description","fidelity":"reconstruction|approximate","limitations":[],"objects":[...]}
+For smooth paths with clear shape evidence, add "shape":{"monotone":"increasing|decreasing|none"}. This describes IMAGE y as x increases: a visually rising curve is decreasing. Use none for genuine peaks/valleys/oscillations; do not infer monotonicity just from its two endpoints. Identify every significant local maximum and minimum (including broad, shallow turns) BEFORE placing support landmarks; include their source-pixel coordinates explicitly in points. Preserve flat prefixes, sharp onsets, plateau heights and tails as separate semantic landmarks. A larger landmark budget does not excuse inaccurate positions. Read coordinates against the SAME plot axes for all series; never independently rescale a series to its own height. Identify same-colour solid and dashed curves as separate data objects with role=data and stable legend references. Dash gaps are missing observations of a styled continuous curve, not zero-valued points; genuine data gaps remain separate pieces. Record uncertainty in limitations when a hidden turn cannot be located.
+For smooth plot curves, independently inspect visible interior crossings and include "relations":[{"kind":"crossing","seriesIds":["s1","s2"],"at":[SOURCE_PIXEL_X,SOURCE_PIXEL_Y]}]. Record crossings from the SOURCE, not from your drafted points; missing valleys can otherwise erase crossings. A shared start is not an interior crossing. Do not invent crossings where lines only approach each other. Include every visible tick as a short linear path with role=tick, its separate numeric label, and both axis paths with role=axis.
+Schema: {"canvas":{"width":EXACT_IMAGE_WIDTH,"height":EXACT_IMAGE_HEIGHT,"unit":"px"},"type":"plot|diagram|table|regions|mixed|geometry","summary":"short description","fidelity":"reconstruction|approximate","limitations":[],"relations":[],"objects":[...]}
 Every object has a unique stable id, kind, optional role (data,reference,axis,tick,grid,annotation), optional z (background=0, data=10, text=30). Styles use {"stroke":"#rrggbb or none","fill":"#rrggbb or none","width":SOURCE_PIXEL_WIDTH,"dash":"solid|dashed|dotted","arrow":"end|both"}. Width is usually 1-2 source pixels. All sizes including fontSize, radiusPx, rowHeight, swatchWidth are SOURCE PIXELS, never normalised.
 Objects:
 1. {"id":"...","kind":"text","at":[centreX,centreY],"text":"literal text or $LaTeX$","fontSize":14,"font":"serif|sans","color":"#000000","rotate":0,"anchor":"center|west|east","bold":false}. Use real LaTeX math for subscripts/superscripts/Greek; plain prose remains outside $...$. rotated axis labels use rotate=90. Preserve individual colours. One object per printed label; identical tick values at DIFFERENT locations are distinct.

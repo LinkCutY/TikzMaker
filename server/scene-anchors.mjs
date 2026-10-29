@@ -1,7 +1,8 @@
 /** Fit existing axis/tick LINE primitives to source pixels. This estimates a
  * small fixed set of line positions; it never follows or samples data curves.
  * All observations stay in source pixels until converted at the scene boundary. */
-const numeric=text=>/^[-+−]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(String(text||'').replace(/\$/g,'').trim());
+import { tickNumber } from './plot-frame.mjs';
+const numeric=text=>Number.isFinite(tickNumber(text));
 function lineOf(o,w,h){
   if(o.kind!=='path'||o.connection!=='linear'||o.points?.length!==2||o.closed||o.style?.arrow||!['solid',undefined].includes(o.style?.dash))return null;
   const c=o.style?.stroke||'#000000';if(!/^#[0-9a-f]{6}$/i.test(c))return null;
@@ -85,9 +86,20 @@ export function groundSceneAxes(scene,raster){
   for(const o of objects)delete o.endpointAnchors;
   const lines=scene.objects.map(o=>lineOf(o,w,h)).filter(Boolean),byId=new Map(objects.map(o=>[o.id,o])),reports=[];
   for(const axis of lines.filter(l=>l.length>Math.min(w,h)*.45)){
-    const ticks=lines.filter(t=>t.dim!==axis.dim&&t.length>=2&&t.length<=12&&
+    let ticks=lines.filter(t=>t.dim!==axis.dim&&t.length>=2&&t.length<=12&&
       Math.min(Math.abs(t.lo-axis.normal),Math.abs(t.hi-axis.normal))<3&&t.normal>=axis.lo-axis.length*.2&&t.normal<=axis.hi+axis.length*.2);
-    if(ticks.length<3)continue;
+    // Models sometimes emit tick labels but omit the short tick paths. Propose
+    // one finite line template per numeric label, then require source support.
+    if(ticks.length<2){
+      ticks=scene.objects.filter(o=>o.kind==='text'&&numeric(o.text)&&o.at).map(o=>{
+        const p=[o.at[0]*w/1000,o.at[1]*h/1000],along=p[axis.dim],across=p[1-axis.dim]-axis.normal;
+        if(along<axis.lo-8||along>axis.hi+8||Math.abs(across)<3||Math.abs(across)>35)return null;
+        const sign=Math.sign(across),a=axis.normal,b=a+sign*5;
+        let id='measured-tick-'+axis.id+'-'+o.id;while(byId.has(id))id+='-';
+        return {id,dim:1-axis.dim,normal:along,lo:Math.min(a,b),hi:Math.max(a,b),length:5,labelId:o.id,synthetic:true};
+      }).filter(Boolean);
+    }
+    if(ticks.length<2)continue;
     const fitted=fitAxis(raster,axis);if(!fitted)continue;
     const globalMatches=matchTickRows(raster,axis,fitted,ticks);
     const grounded=globalMatches||[],scale=(fitted.hi-fitted.lo)/axis.length;
@@ -121,6 +133,11 @@ export function groundSceneAxes(scene,raster){
     });
     const pairs=[];
     for(const {tick,position} of grounded){
+      if(tick.synthetic){
+        const q=v=>axis.dim===0?[tick.normal/w*1000,v/h*1000]:[v/w*1000,tick.normal/h*1000];
+        const object={id:tick.id,kind:'path',role:'tick',connection:'linear',points:[q(tick.lo),q(tick.hi)],style:{stroke:'#000000',width:1}};
+        objects.push(object);byId.set(object.id,object);
+      }
       const obj=byId.get(tick.id),delta=position-tick.normal,offset=fitted.normal-axis.normal;
       obj.points=obj.points.map(p=>{
         const q=[p[0]*w/1000,p[1]*h/1000];q[axis.dim]+=delta;q[1-axis.dim]+=offset;
@@ -129,7 +146,7 @@ export function groundSceneAxes(scene,raster){
       const labels=scene.objects.filter(o=>o.kind==='text'&&numeric(o.text)&&o.at).map(o=>{
         const p=[o.at[0]*w/1000,o.at[1]*h/1000];
         return {o,along:Math.abs(p[axis.dim]-tick.normal),across:Math.abs(p[1-axis.dim]-axis.normal)};
-      }).filter(l=>l.along<5&&l.across>3&&l.across<40).sort((a,b)=>a.along-b.along||a.across-b.across);
+      }).filter(l=>tick.labelId?l.o.id===tick.labelId:l.along<5&&l.across>3&&l.across<40).sort((a,b)=>a.along-b.along||a.across-b.across);
       if(labels.length){
         const label=byId.get(labels[0].o.id),p=[label.at[0]*w/1000,label.at[1]*h/1000];
         p[axis.dim]+=delta;p[1-axis.dim]+=offset;label.at=[p[0]/w*1000,p[1]/h*1000];

@@ -8,6 +8,7 @@
  * reduction target, not a validation limit or a request for uniform samples.
  * Preserve additional points when needed for shape, up to maxPoints.
  */
+import { structuralExtrema } from './curve-structure.mjs';
 export const CURVE_BUDGET = Object.freeze({
   maxPoints: 48, spacing: 40, noiseTolerance: 2,
   cornerDegrees: 60, turnNoiseDegrees: 3, inflectionDegrees: 15,
@@ -25,9 +26,9 @@ function chordDistance(p,a,b){
 
 // Only remove redundant model landmarks for complexity measurement. No image
 // data is read, and these simplified points are NOT substituted into output.
-function simplify(points,epsilon){
+function simplify(points,epsilon,protectedIndices=[]){
   if(points.length<3)return points;
-  const keep=new Set([0,points.length-1]),pending=[[0,points.length-1]];
+  const keep=new Set([0,...protectedIndices,points.length-1]),anchors=[...keep].sort((a,b)=>a-b),pending=anchors.slice(1).map((b,i)=>[anchors[i],b]);
   while(pending.length){
     const [lo,hi]=pending.pop();let worst=-1,error=epsilon;
     for(let i=lo+1;i<hi;i++){
@@ -52,7 +53,8 @@ export function analyzeCurveBudget(points,options={}){
   const spacing=Number.isFinite(options.spacing)&&options.spacing>0?options.spacing:CURVE_BUDGET.spacing;
   const metric=points.map((p,index)=>({p:[p[0]*width/diagonal,p[1]*height/diagonal],index}))
     .filter((v,i,all)=>!i||distance(v.p,all[i-1].p)>1e-9);
-  const clean=simplify(metric,epsilon),m=clean.length;
+  const extrema=structuralExtrema(metric.map(q=>q.p),epsilon),protectedOriginal=new Set(extrema.map(e=>metric[e.index].index));
+  const clean=simplify(metric,epsilon,extrema.map(e=>e.index)),m=clean.length;
   if(m<2)return empty;
   const turns=Array(m).fill(0),arc=Array(m).fill(0),keys=new Set([0,m-1]);
   for(let i=1;i<m;i++)arc[i]=arc[i-1]+distance(clean[i-1].p,clean[i].p);
@@ -60,7 +62,7 @@ export function analyzeCurveBudget(points,options={}){
     const [a,b,c]=[clean[i-1].p,clean[i].p,clean[i+1].p];
     const u=[b[0]-a[0],b[1]-a[1]],v=[c[0]-b[0],c[1]-b[1]];
     turns[i]=Math.atan2(u[0]*v[1]-u[1]*v[0],u[0]*v[0]+u[1]*v[1]);
-    const extremum=u[1]*v[1]<0&&Math.min(Math.abs(u[1]),Math.abs(v[1]))>=epsilon;
+    const extremum=protectedOriginal.has(clean[i].index);
     if(extremum||Math.abs(turns[i])>=rad(CURVE_BUDGET.cornerDegrees))keys.add(i);
   }
   // A meaningful inflection is a change in the SIGN of turning, with enough

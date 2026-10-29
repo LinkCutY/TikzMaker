@@ -1,6 +1,7 @@
 import { encodePng } from './pngwrite.mjs';
 import { SCENE_PROMPT,sceneFromPixels,sceneToPixels,validateScene } from './scene.mjs';
 import { refineScene, compactSceneCurves } from './scene-fit.mjs';
+import { refreshPlotCoordinates } from './plot-frame.mjs';
 
 /** Planner rectangles must partition content, not overlap/cut away a panel.
  * Coverage is only a check; source pixels are never emitted as geometry. */
@@ -26,12 +27,37 @@ export function validateRegions(regions,raster){
   return {ok:errors.length===0,errors,coverage};
 }
 export function combineRegions(parts,raster){
-  const objects=[],limitations=[];
+  const objects=[],relations=[],limitations=[],plotFrames=[],coordinateAnchors=[],coordinateReports=[];
   for(const [i,part] of parts.entries()){
     const [x,y,w,h]=part.box,local=sceneToPixels(part.scene,w,h);
     const p=q=>[q[0]+x,q[1]+y];
+    for(const r of local.relations||[])relations.push({...r,at:p(r.at),seriesIds:r.seriesIds.map(id=>'panel-'+i+'-'+id)});
+    for(const f of part.scene.plotFrames||[])plotFrames.push({...f,id:'panel-'+i+'-'+f.id,box:[f.box[0]+x,f.box[1]+y,f.box[2],f.box[3]],axisIds:f.axisIds.map(id=>'panel-'+i+'-'+id)});
+    if(part.scene.coordinateReport)coordinateReports.push(part.scene.coordinateReport);
+    for(const r of part.scene.coordinateAnchors||[]){
+      const normalOffset=r.direction==='x'?y:x,alongOffset=r.direction==='x'?x:y;
+      const line=q=>({...q,normal:q.normal+normalOffset,lo:q.lo+alongOffset,hi:q.hi+alongOffset});
+      coordinateAnchors.push({...r,axisId:'panel-'+i+'-'+r.axisId,before:line(r.before),after:line(r.after),ticks:r.ticks.map(t=>({...t,tickId:'panel-'+i+'-'+t.tickId,labelId:'panel-'+i+'-'+t.labelId,pixel:t.pixel+alongOffset,beforePixel:t.beforePixel+alongOffset}))});
+    }
     for(const o of local.objects){
       o.id='panel-'+i+'-'+o.id;
+      if(o.frameId)o.frameId='panel-'+i+'-'+o.frameId;
+      if(o.frameAnchor)o.frameAnchor={...o.frameAnchor,axisId:'panel-'+i+'-'+o.frameAnchor.axisId};
+      if(o.endpointAnchors)for(const anchor of Object.values(o.endpointAnchors)){
+        if(anchor.at)anchor.at=p(anchor.at);
+        if(anchor.axisId)anchor.axisId='panel-'+i+'-'+anchor.axisId;
+        if(anchor.tickId)anchor.tickId='panel-'+i+'-'+anchor.tickId;
+      }
+      if(o.fit){
+        o.fit={...o.fit,frameId:o.frameId};
+        if(o.fit.priorPoints)o.fit.priorPoints=o.fit.priorPoints.map(q=>[(x+q[0]*w/1000)/raster.w*1000,(y+q[1]*h/1000)/raster.h*1000]);
+        if(o.fit.endpointConstraintsPx)o.fit.endpointConstraintsPx=Object.fromEntries(Object.entries(o.fit.endpointConstraintsPx).map(([key,value])=>[key,value+y]));
+      }
+      if(o.fitDiagnostics){
+        o.fitDiagnostics={...o.fitDiagnostics,frameId:o.frameId};
+        if(o.fitDiagnostics.structure)o.fitDiagnostics.structure=o.fitDiagnostics.structure.map(e=>({...e,yPx:e.yPx+y}));
+        if(o.fitDiagnostics.ownership)o.fitDiagnostics.ownership={...o.fitDiagnostics.ownership,competitors:o.fitDiagnostics.ownership.competitors.map(id=>'panel-'+i+'-'+id)};
+      }
       if(o.kind==='legend')o.entries=o.entries.map(e=>({...e,seriesId:'panel-'+i+'-'+e.seriesId}));
       if(o.at)o.at=p(o.at);if(o.start)o.start=p(o.start);if(o.points)o.points=o.points.map(p);if(o.segments)o.segments=o.segments.map(s=>s.map(p));if(o.marker?.points)o.marker.points=o.marker.points.map(p);
       if(o.upper)o.upper=o.upper.map(p);if(o.lower)o.lower=o.lower.map(p);
@@ -40,9 +66,11 @@ export function combineRegions(parts,raster){
     }
     if(part.scene.fidelity==='approximate')limitations.push(...(part.scene.limitations||['approximate region '+i]));
   }
-  const combined=sceneFromPixels({canvas:{width:raster.w,height:raster.h,unit:'px'},type:'mixed',summary:parts.length+' independent content regions',fidelity:limitations.length?'approximate':'reconstruction',limitations,objects},raster.w,raster.h);
+  const combined=sceneFromPixels({canvas:{width:raster.w,height:raster.h,unit:'px'},type:'mixed',summary:parts.length+' independent content regions',fidelity:limitations.length?'approximate':'reconstruction',limitations,objects,relations},raster.w,raster.h);
   combined.budgetRegions=Object.fromEntries(parts.map((part,i)=>['panel-'+i,{width:part.box[2],height:part.box[3]}]));
-  return combined;
+  combined.plotFrames=plotFrames;combined.coordinateAnchors=coordinateAnchors;
+  combined.coordinateReport={ok:coordinateReports.every(r=>r.ok),panels:coordinateReports};
+  return refreshPlotCoordinates(combined,raster);
 }
 function crop(raster,box){
   const [x,y,w,h]=box,rgb=new Uint8Array(w*h*3);
