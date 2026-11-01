@@ -9,7 +9,7 @@ function modelFeedbackScene(scene,width,height){
   const pixels=sceneToPixels(scene,width,height);
   // Derived UV/fit diagnostics must not masquerade as source-pixel geometry
   // in the next model response. Keep only the public semantic object protocol.
-  const derived=['fit','fitDiagnostics','plotCoordinates','frameId','frameAnchor','endpointAnchors','pointBudget'];
+  const derived=['fit','fitDiagnostics','plotCoordinates','frameId','frameAnchor','endpointAnchors','sourceEndpoints','referenceMeasurement','pointBudget'];
   for(const o of pixels.objects)for(const key of derived)delete o[key];
   for(const key of ['plotFrames','coordinateAnchors','coordinateReport','geometryReport','sourceSize','budgetRegions','partition'])delete pixels[key];
   return pixels;
@@ -54,9 +54,35 @@ export async function* runSceneGeneration(opts,services){
             scene=validated.scene;break;
           }catch(e){protocolError=e.message;if(trial===1||remaining()<45000)throw e;}
         }
+        // Read topology independently: drafting all points in one response can
+        // erase a crossing and then incorrectly report no relations at all.
+        if(!scene.partition&&scene.type==='plot'&&remaining()>35000){
+          const paths=scene.objects.filter(o=>o.kind==='path'&&['smooth','bezier','linear','step'].includes(o.connection)&&!o.style?.arrow&&!['axis','tick','grid','reference','annotation'].includes(o.role));
+          if(paths.length>=2){
+            yield {type:'step',id:'crossing-read',label:'独立核对交点与曲线次序',status:'running'};
+            try{
+              const out=await services.chat({...opts,signal:controller.signal,temperature:0,thinking:'disabled',maxTokens:3500,timeoutMs:Math.min(20000,remaining()-15000),messages:[{role:'user',content:[
+                {type:'text',text:`Inspect ONLY curve intersections in this SOURCE image (${raster.w} by ${raster.h} pixels). Match series IDs using colours AND dash styles. Do not trust draft geometry. Return JSON {"relations":[{"kind":"crossing","seriesIds":["idA","idB"],"at":[pixelX,pixelY],"leftAbove":"idA","rightAbove":"idB"}],"limitations":[]}. "Above" means visually higher. Read both sides independently; omit order fields if uncertain. Exclude coincident baseline stretches, shared starts, tangencies and mere close approaches. Include solid-solid, dotted-solid and dotted-dotted crossings where evidenced. All at coordinates are IMAGE PIXELS (top-left origin, y DOWN), never axis data values. Series: `+JSON.stringify(paths.map(o=>({id:o.id,style:o.style})))},
+                {type:'image_url',image_url:{url:opts.image}}]}]});
+              const parsed=services.parseJsonObject(out.text);
+              if(out.finishReason==='length'||!Array.isArray(parsed.relations))throw new Error('Invalid crossing response');
+              const ids=new Set(paths.map(o=>o.id)),relations=parsed.relations;
+              if(relations.length>120||relations.some(r=>r?.kind!=='crossing'||!Array.isArray(r.seriesIds)||r.seriesIds.length!==2||r.seriesIds[0]===r.seriesIds[1]||r.seriesIds.some(id=>!ids.has(id))||!Array.isArray(r.at)||r.at.length!==2||!r.at.every(Number.isFinite)||r.at[0]<0||r.at[0]>raster.w||r.at[1]<0||r.at[1]>raster.h||['leftAbove','rightAbove'].some(k=>r[k]!=null&&!r.seriesIds.includes(r[k]))))throw new Error('Invalid crossing coordinates or series IDs');
+              const found=relations.map(r=>({...r,source:'independent-model-read',at:[r.at[0]/raster.w*1000,r.at[1]/raster.h*1000]}));
+              // An empty second read cannot silently delete an earlier crossing.
+              scene.relations=[...found,...(scene.relations||[]).filter(r=>!found.some(q=>q.seriesIds.every(id=>r.seriesIds.includes(id))&&Math.hypot((q.at[0]-r.at[0])*raster.w/1000,(q.at[1]-r.at[1])*raster.h/1000)<8))];
+              yield {type:'step',id:'crossing-read',status:'ok',detail:found.length+' 个交点单独识别'};
+            }catch(e){
+              scene.limitations=[...(scene.limitations||[]),'Independent crossing review unavailable: '+e.message];
+              yield {type:'step',id:'crossing-read',status:'fail',detail:e.message.slice(0,140)};
+            }
+          }
+        }
         if(!scene.partition)scene=refineScene(scene,raster);
+        if(scene.relationEvidence)yield {type:'step',id:'crossing-evidence',label:'原图局部交点证据核验',status:scene.relationEvidence.rejected.length?'fail':'ok',
+          detail:scene.relationEvidence.accepted+' 个通过核验 · '+scene.relationEvidence.rejected.length+' 个未证实，不作为拟合约束'};
         scene.geometryReport=checkSceneGeometry(scene,raster);
-        yield {type:'step',id:'geometry-check',label:'端点与峰谷坐标校验',status:scene.geometryReport.ok?'ok':'fail',
+        yield {type:'step',id:'geometry-check',label:'端点、峰谷、交点与边界校验',status:scene.geometryReport.ok?'ok':'fail',
           detail:scene.geometryReport.ok?'最终曲线与结构约束一致':JSON.stringify(scene.geometryReport.issues.slice(0,2))};
         if(scene.coordinateAnchors?.length)yield {type:'step',id:'coordinate-anchors',label:'原图坐标轴与刻度定位',status:'ok',
           detail:scene.coordinateAnchors.length+' 条轴按原图直线校正 · 曲线、刻度统一使用原图像素坐标'};
@@ -66,7 +92,7 @@ export async function* runSceneGeneration(opts,services){
         const provisional=scene.objects.filter(o=>o.fitDiagnostics?.status==='provisional');
         const kept=scene.objects.filter(o=>o.fitDiagnostics?.status==='kept-model');
         const verified=scene.objects.filter(o=>o.fitDiagnostics?.status==='verified');
-        if(fitted.length||provisional.length||kept.length||verified.length)yield {type:'step',id:'curve-fit',label:'约束曲线拟合与局部误差检查',status:provisional.length||kept.some(o=>o.fitDiagnostics.requiresReview)?'fail':'ok',
+        if(fitted.length||provisional.length||kept.length||verified.length)yield {type:'step',id:'curve-fit',label:'约束曲线拟合与局部误差检查',status:scene.objects.some(o=>o.fitDiagnostics?.requiresReview)?'fail':'ok',
           detail:fitted.length+' 条已校正 · '+verified.length+' 条原几何通过证据核对 · '+provisional.length+' 条采用改善候选，局部仍需修正 · '+kept.length+' 条保留模型几何'+(kept.length?'（'+kept.slice(0,2).map(o=>o.id+': '+o.fitDiagnostics.reason).join('; ')+'）':'')};
         built=compileScene(scene,{width:raster.w,height:raster.h});
         yield {type:'step',id,status:'ok',detail:scene.type+' · '+scene.objects.length+' 个语义对象'};
@@ -85,7 +111,9 @@ export async function* runSceneGeneration(opts,services){
       }
       const fitIssues=scene.objects.filter(o=>o.fitDiagnostics?.requiresReview||
         o.fitDiagnostics?.status==='kept-model'&&o.fitDiagnostics.before?.rmse>4).map(o=>
-          o.id+': curve coordinates still need local correction; '+JSON.stringify(o.fitDiagnostics));
+          o.id+': curve coordinates still need local correction; '+JSON.stringify({status:o.fitDiagnostics.status,reason:o.fitDiagnostics.reason,
+            before:o.fitDiagnostics.before,best:o.fitDiagnostics.best,unsupportedEndpoints:o.fitDiagnostics.unsupportedEndpoints,
+            unresolvedStructure:o.fitDiagnostics.unresolvedStructure,worstResidualTerms:o.fitDiagnostics.worstResidualTerms}));
       const coordinateIssues=scene.coordinateReport?.ok===false?['Plot coordinate calibration is incomplete or inconsistent.']:[];
       const geometryIssues=(scene.geometryReport?.issues||[]).map(issue=>'Final geometry constraint failed: '+JSON.stringify(issue));
       const limitations=[...(Array.isArray(scene.limitations)?scene.limitations:[]),...fitIssues,...coordinateIssues,...geometryIssues];
@@ -93,12 +121,14 @@ export async function* runSceneGeneration(opts,services){
       const residuals=scene.objects.map(o=>o.fitDiagnostics).filter(d=>d?.before).map(d=>
         d.status==='kept-model'?d.before.rmse:d.best?.rmse??d.before.rmse);
       const coordinatePenalty=residuals.length?Math.min(99,residuals.reduce((a,b)=>a+b,0)/residuals.length)*.001:0;
-      const rank=(ok?10000:compiled.ok?1000:0)+(visual?.score||0)-coordinatePenalty;
+      const relationFailures=(scene.geometryReport?.issues||[]).filter(i=>i.kind.includes('crossing')).length;
+      const rank=(ok?10000:compiled.ok?1000:0)+(visual?.score||0)-coordinatePenalty-Math.min(180,30*relationFailures);
       const candidate={scene,built,compiled,visual,round,ok,rank,limitations};
       versions.push({round,score:visual?.score??null,compiled:compiled.ok,ok,rank,kind:round===1?'initial':'repair'});
       if(!best||rank>best.rank)best=candidate;
       if(ok)break;
       feedback=JSON.stringify({compileErrors:compiled.errors,issues:visual?.issues,limitations,coordinateAnchors:scene.coordinateAnchors,coordinateReport:scene.coordinateReport,geometryReport:scene.geometryReport,
+        sourceEndpoints:scene.objects.filter(o=>o.sourceEndpoints).map(o=>({id:o.id,coordinateSpace:'source-px',ends:o.sourceEndpoints})),
         instructions:visual?.instructions,coordinateRule:'Use SOURCE PIXEL coordinates, keep measured tick positions. Correct curve landmarks against the image, not guessed axis fractions. Improved candidates with local residuals must be refined, not rolled back to the old coordinates.'}).slice(0,10000);
     }
     if(best){

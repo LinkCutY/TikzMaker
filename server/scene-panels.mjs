@@ -31,7 +31,8 @@ export function combineRegions(parts,raster){
   for(const [i,part] of parts.entries()){
     const [x,y,w,h]=part.box,local=sceneToPixels(part.scene,w,h);
     const p=q=>[q[0]+x,q[1]+y];
-    for(const r of local.relations||[])relations.push({...r,at:p(r.at),seriesIds:r.seriesIds.map(id=>'panel-'+i+'-'+id)});
+    for(const r of local.relations||[])relations.push({...r,at:p(r.at),seriesIds:r.seriesIds.map(id=>'panel-'+i+'-'+id),
+      ...(r.leftAbove?{leftAbove:'panel-'+i+'-'+r.leftAbove}:{}),...(r.rightAbove?{rightAbove:'panel-'+i+'-'+r.rightAbove}:{})});
     for(const f of part.scene.plotFrames||[])plotFrames.push({...f,id:'panel-'+i+'-'+f.id,box:[f.box[0]+x,f.box[1]+y,f.box[2],f.box[3]],axisIds:f.axisIds.map(id=>'panel-'+i+'-'+id)});
     if(part.scene.coordinateReport)coordinateReports.push(part.scene.coordinateReport);
     for(const r of part.scene.coordinateAnchors||[]){
@@ -53,6 +54,7 @@ export function combineRegions(parts,raster){
         if(o.fit.priorPoints)o.fit.priorPoints=o.fit.priorPoints.map(q=>[(x+q[0]*w/1000)/raster.w*1000,(y+q[1]*h/1000)/raster.h*1000]);
         if(o.fit.endpointConstraintsPx)o.fit.endpointConstraintsPx=Object.fromEntries(Object.entries(o.fit.endpointConstraintsPx).map(([key,value])=>[key,value+y]));
       }
+      if(o.sourceEndpoints)for(const measured of Object.values(o.sourceEndpoints))measured.y+=y;
       if(o.fitDiagnostics){
         o.fitDiagnostics={...o.fitDiagnostics,frameId:o.frameId};
         if(o.fitDiagnostics.structure)o.fitDiagnostics.structure=o.fitDiagnostics.structure.map(e=>({...e,yPx:e.yPx+y}));

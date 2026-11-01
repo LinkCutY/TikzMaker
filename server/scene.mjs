@@ -2,7 +2,7 @@
  * this compiler. There is no raster-to-path or dense contour fallback. */
 import { safeNodeText, cjkPreamble } from './textext.mjs';
 import { CURVE_BUDGET, CURVE_BUDGET_PROMPT } from './curve-budget.mjs';
-import { clipCubics } from './curve-clip.mjs';
+import { clipCubics, linearCubics, stepPoints } from './curve-clip.mjs';
 export { analyzeCurveBudget, pathBudget } from './curve-budget.mjs';
 
 export const SCENE_LIMITS={objects:260,paths:60,labels:160,smoothPoints:CURVE_BUDGET.maxPoints,corners:80,markers:100,segments:24};
@@ -130,7 +130,10 @@ export function validateScene(input){
   if(labels>SCENE_LIMITS.labels||paths>SCENE_LIMITS.paths)errors.push('Label/path budget exceeded');
   for(const o of scene.objects)if(o.kind==='legend')for(const e of o.entries||[])if(!seen.has(e.seriesId)||typeof e.text!=='string')errors.push(o.id+': dangling legend reference '+e.seriesId);
   if(scene.relations!=null&&!Array.isArray(scene.relations))errors.push('relations must be an array');
-  else for(const r of scene.relations||[])if(r.kind!=='crossing'||!xy(r.at)||!Array.isArray(r.seriesIds)||r.seriesIds.length!==2||r.seriesIds[0]===r.seriesIds[1]||r.seriesIds.some(id=>!seen.has(id)))errors.push('invalid crossing relation');
+  else {
+    if((scene.relations?.length||0)>120)errors.push('crossing relation budget exceeded (120)');
+    for(const r of scene.relations||[])if(!r||r.kind!=='crossing'||!xy(r.at)||!Array.isArray(r.seriesIds)||r.seriesIds.length!==2||r.seriesIds[0]===r.seriesIds[1]||r.seriesIds.some(id=>!scene.objects.some(o=>o.id===id&&o.kind==='path'&&o.connection!=='none')))errors.push('invalid crossing relation');
+  }
   return {ok:!errors.length,errors,scene};
 }
 
@@ -207,15 +210,26 @@ export function compileScene(input,{width,height,widthCm=16}={}){
       continue;
     }
     let body='';
+    const frame=scene.plotFrames?.find(f=>f.id===o.frameId);
+    if(frame&&!o.closed&&!o.style?.arrow&&!['axis','tick','annotation','grid'].includes(o.role)){
+      const box=frame.box.map((v,i)=>v/(i%2?height:width)*1000);
+      if(o.connection!=='none'){
+        const start=o.start||o.points[0],segments=o.segments||(o.connection==='smooth'?monotoneCubics(o.points):linearCubics(stepPoints(o)));
+        const result=clipCubics(start,segments,box,[width/1000,height/1000]);
+        for(const part of result.paths){
+          const s={...o.style};
+          if(['dashed','dotted'].includes(s.dash)){
+            const period=(s.dash==='dotted'?0:s.dashOn??5)+(s.dashOff??(s.dash==='dotted'?4:3));
+            if(period>0)s.dashPhase=((s.dashPhase??0)+part.offset)%period;
+          }
+          lines.push('\\draw['+style(s)+'] '+p(part.start)+part.segments.map(s=>' .. controls '+p(s[0])+' and '+p(s[1])+' .. '+p(s[2])).join('')+';');
+        }
+      }
+      if(o.marker?.shape&&o.marker.shape!=='none')for(const at of o.marker.points||o.points||[])if(at[0]>=box[0]&&at[0]<=box[0]+box[2]&&at[1]>=box[1]&&at[1]<=box[1]+box[3])marker(at,o.marker,o.style);
+      continue;
+    }
     if(o.connection==='bezier'||o.connection==='smooth'){
       const start=o.start||o.points[0],segments=o.segments||monotoneCubics(o.points);
-      const frame=scene.plotFrames?.find(f=>f.id===o.frameId);
-      if(frame&&!o.closed&&!o.style?.arrow&&!['axis','tick','annotation'].includes(o.role)){
-        const box=frame.box.map((v,i)=>v/(i%2?height:width)*1000),result=clipCubics(start,segments,box);
-        for(const part of result.paths)lines.push('\\draw['+style(o.style)+'] '+p(part.start)+part.segments.map(s=>' .. controls '+p(s[0])+' and '+p(s[1])+' .. '+p(s[2])).join('')+';');
-        if(o.marker?.shape&&o.marker.shape!=='none')for(const at of o.marker.points||o.points||[])if(at[0]>=box[0]&&at[0]<=box[0]+box[2]&&at[1]>=box[1]&&at[1]<=box[1]+box[3])marker(at,o.marker,o.style);
-        continue;
-      }
       body=p(start)+segments.map(s=>' .. controls '+p(s[0])+' and '+p(s[1])+' .. '+p(s[2])).join('');
     }else if(o.connection!=='none'){
       let pts=o.points;
