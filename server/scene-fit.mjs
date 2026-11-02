@@ -12,7 +12,9 @@ import { fitStrokePattern, geometryLookup, dashVisibility, measureExtremum, inkL
 import { measureEndpoint } from './endpoint-evidence.mjs';
 import { legendEvidenceBoxes } from './legend-evidence.mjs';
 import { groundReferenceLines } from './reference-evidence.mjs';
+import { checkDiagramConnections } from './diagram-scene.mjs';
 import { verifyCrossings } from './crossing-evidence.mjs';
+import { prepareRobustEvidence, robustWeight, adaptiveResidualScale } from './robust-fit.mjs';
 
 const rgb=h=>/^#[0-9a-f]{6}$/i.test(h||'')?[1,3,5].map(i=>parseInt(h.slice(i,i+2),16)):null;
 const distance=(a,b)=>Math.hypot(...a.map((v,i)=>v-b[i]));
@@ -82,7 +84,16 @@ function solveOrdered(A,b,direction,start,fixed){
   }
   return x;
 }
-export function fitSplineEvidence(evidence,k,{ridge=.002,interior,monotone=0,weights,endpoints={},structure=null,unitScale=1,deadline=Infinity,robustCount=evidence.length}={}){
+export function fitSplineEvidence(evidence,k,{ridge=.002,interior,monotone=0,weights,endpoints={},structure=null,unitScale=1,deadline=Infinity,robustCount=evidence.length,
+  loss='huber',widthPx=1,domainWidthPx=1000,ransac=true,robustProfile=null}={}){
+  if(!evidence.length||evidence.some(p=>!Number.isFinite(p[0])||!Number.isFinite(p[1])))return null;
+  if(!['linear','huber','soft-l1'].includes(loss))throw Error('Unknown robust loss: '+loss);
+  robustCount=Math.max(0,Math.min(evidence.length,Math.floor(robustCount)));
+  const profile=robustProfile||prepareRobustEvidence(evidence.slice(0,robustCount),{unitScale,widthPx,domainWidthPx,
+    breaks:structure?.events?.map(e=>e.t)||[],deadline,ransac:ransac&&loss!=='linear'});
+  if(profile.sigmaPx.length!==robustCount||profile.initialWeights.length!==robustCount)throw Error('Robust profile length mismatch');
+  const noiseFloor=Math.max(.5,widthPx/2);
+  let robustDiagnostics={loss,iterations:0,scaleMultiplier:1,downweighted:0,protectedObservations:evidence.length-robustCount,ransac:profile.report};
   const fixed={};
   if(Number.isFinite(endpoints.start))fixed[0]=endpoints.start;
   if(Number.isFinite(endpoints.end))fixed[k-1]=endpoints.end;
@@ -90,14 +101,20 @@ export function fitSplineEvidence(evidence,k,{ridge=.002,interior,monotone=0,wei
   if(knots.length!==k+4||knots.some((v,i)=>!Number.isFinite(v)||(i&&v<knots[i-1])))return null;
   const roughness=roughnessMatrix(knots,k),constraints=shapeConstraints(knots,k,structure);
   for(const [index,value] of Object.entries(fixed))constraints.eq.push({row:Array.from({length:k},(_,i)=>i===Number(index)?1:0),rhs:value});
-  for(let iteration=0;iteration<4;iteration++){
+  for(let iteration=0;iteration<(loss==='linear'?1:8);iteration++){
     if(Date.now()>deadline)return null;
     const A=Array.from({length:k},()=>Array(k).fill(0)),b=Array(k).fill(0);
+    const residuals=coeff?rows.slice(0,robustCount).map((row,n)=>(row.reduce((s,v,i)=>s+v*coeff[i],0)-evidence[n][1])*unitScale):[];
+    const scale=adaptiveResidualScale(residuals,profile.sigmaPx);let downweighted=0;
     for(let n=0;n<rows.length;n++){
       const row=rows[n],y=evidence[n][1];
-      const residual=coeff?Math.abs(row.reduce((s,v,i)=>s+v*coeff[i],0)-y):0;
-      const robustLimit=4/unitScale;
-      const weight=(weights?.[n]??1)*(n<robustCount&&residual>robustLimit?robustLimit/residual:1);
+      const ordinary=n<robustCount&&loss!=='linear';
+      const reweight=ordinary?(coeff?robustWeight(residuals[n]/(profile.sigmaPx[n]*scale),loss):profile.initialWeights[n]):1;
+      if(reweight<.5)downweighted++;
+      // Verified crossings appended after robustCount keep their full weight;
+      // endpoint and shape equalities/inequalities remain in the same solver.
+      const precision=ordinary?(noiseFloor/profile.sigmaPx[n])**2:1;
+      const weight=(weights?.[n]??1)*reweight*precision;
       for(let i=0;i<k;i++){b[i]+=weight*row[i]*y;for(let j=0;j<k;j++)A[i][j]+=weight*row[i]*row[j];}
     }
     for(let i=0;i<k;i++)A[i][i]+=1e-7;
@@ -110,11 +127,15 @@ export function fitSplineEvidence(evidence,k,{ridge=.002,interior,monotone=0,wei
       A[j][j]=1;b[j]=value;
     }
     const unconstrained=solve(A,b);if(!unconstrained)return null;
+    const previous=coeff;
     coeff=structure?constrainedCoefficients(A,b,constraints.eq,constraints.ineq,solve):monotone?solveOrdered(A,b,monotone,coeff||unconstrained,fixed):unconstrained;if(!coeff)return null;
+    robustDiagnostics={...robustDiagnostics,iterations:iteration+1,scaleMultiplier:scale,downweighted,
+      sigmaRangePx:robustCount?[Math.min(...profile.sigmaPx)*scale,Math.max(...profile.sigmaPx)*scale]:[]};
+    if(previous&&iteration>=2&&Math.max(...coeff.map((v,i)=>Math.abs(v-previous[i])))*unitScale<.01)break;
   }
   const value=x=>basis(x,knots,k).reduce((s,v,i)=>s+v*coeff[i],0);
   const rmse=Math.sqrt(evidence.reduce((s,[x,y])=>s+(value(x)-y)**2,0)/evidence.length);
-  return {k,knots,coeff,value,rmse};
+  return {k,knots,coeff,value,rmse,robustDiagnostics};
 }
 
 /** Convert each polynomial interval exactly, including repeated knots (knees).
@@ -373,6 +394,10 @@ function fitSmooth(raster,o,objects,frame,deadline=Infinity,legendBoxes=null,rel
   const crossingWeight=train.length/24*8;
   const training=[...train.map(([t,y])=>[t,toY(y)]),...crossings.map(r=>[r.t,toY(r.y)])];
   const trainingWeights=[...weights,...crossings.map(r=>crossingWeight*r.confidence)];
+  // Training data only: no validation stripes/dashes enter RANSAC or scale
+  // estimation. Reuse one bounded initializer across all knot candidates.
+  const robustProfile=prepareRobustEvidence(training.slice(0,train.length),{unitScale:yScale,widthPx:o.style.width||1,
+    domainWidthPx:(hi-lo)*w/1000,breaks:events.map(e=>e.t),deadline:Math.min(deadline,Date.now()+600)});
   // A model coordinate is never promoted to a measured hard constraint.
   const unsupportedEndpoints=[];
   for(const [key,t] of [['start',0],['end',1]]){
@@ -386,7 +411,7 @@ function fitSmooth(raster,o,objects,frame,deadline=Infinity,legendBoxes=null,rel
   function candidate(interior,relaxed=false,ridge=1e-8){
     if(Date.now()>deadline)return null;
     interior=interior.slice().sort((a,b)=>a-b);const k=interior.length+4;if(k>16)return null;
-    const fit=fitSplineEvidence(training,k,{ridge,interior,weights:trainingWeights,robustCount:train.length,
+    const fit=fitSplineEvidence(training,k,{ridge,interior,weights:trainingWeights,robustCount:train.length,robustProfile,widthPx:o.style.width||1,
       endpoints:normalizedEndpoints,structure:relaxed?{events:normalizedStructure.events.filter(e=>e.observation?.source==='finite-quadratic-window'),intervals:evidenceMonotone?[{lo:0,hi:1,sign:-evidenceMonotone}]:[]}:normalizedStructure,unitScale:yScale,deadline});
     if(!fit)return null;
     const uvValue=fit.value,value=t=>fromY(uvValue(t));
@@ -485,6 +510,7 @@ function fitSmooth(raster,o,objects,frame,deadline=Infinity,legendBoxes=null,rel
     if(improved){best=improved;provisional=true;}
   }
   const diagnostics={terms:evidence.length,monotone:events.length?'piecewise':monotone,structure:events.map(e=>({t:e.t,kind:e.kind,yPx:e.y,tolerancePx:e.tolerance,observation:e.observation})),
+    robust:best?.robustDiagnostics??{loss:'huber',ransac:robustProfile.report},
     crossings:{count:crossings.length,weightPerWindow:8,maxErrorPx:best?.crossingError??null},
     candidateSummary:fits.slice(0,8).map(f=>({parameters:f.k,relaxed:f.relaxed,ridge:f.ridge,bending:f.bending,...f.metrics})),
     worstResidualTerms:best?test.map(([t,y])=>({t,y,errorPx:Math.abs(best.value(t)-y)})).sort((a,b)=>b.errorPx-a.errorPx).slice(0,5):[],
@@ -521,6 +547,7 @@ function fitSmooth(raster,o,objects,frame,deadline=Infinity,legendBoxes=null,rel
 }
 
 export function refineScene(scene,raster){
+  if(scene.type==='diagram')return {...scene,diagramReport:checkDiagramConnections(scene)};
   const deadline=Date.now()+15000;
   scene=attachPlotFrames(groundSceneAxes(scene,raster),raster);
   scene=verifyCrossings(scene,raster,Math.min(deadline,Date.now()+3500));
@@ -554,7 +581,7 @@ export function refineScene(scene,raster){
     if(measurement)o.sourceEndpoints={...o.sourceEndpoints,[end]:measurement};
   }
   const refined=objects.map(o=>{
-    if(o.kind!=='path'||o.style?.arrow||['axis','tick','grid','reference','annotation'].includes(o.role))return o;
+    if(o.kind!=='path'||o.style?.arrow||['axis','tick','grid','reference','annotation','edge','node','container'].includes(o.role))return o;
     // Only an isolated horizontal ring series has unambiguous projection
     // ownership. Other hollow shapes stay model-read until independently fitted.
     if(o.marker?.filled===false&&o.marker?.shape==='circle'&&o.connection==='linear'&&o.points?.length===2&&Math.abs(o.points[0][1]-o.points[1][1])<10){

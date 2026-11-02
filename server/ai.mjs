@@ -29,6 +29,7 @@ import { fitPrintedMarkers, fitReferenceLine, measureOpenAxes } from './plot-obs
 import { fitAnalyticImage, colourDirection } from './analytic-image-fit.mjs';
 import { runSceneGeneration } from './scene-workflow.mjs';
 import { CURVE_BUDGET_PROMPT } from './curve-budget.mjs';
+import { validateTextFigure } from './text-validation.mjs';
 
 /** True when the class-specific structural checks passed (the reviewer is separate). */
 function clsOk(gate) {
@@ -451,7 +452,7 @@ const REVIEWER_SYSTEM = [
 
 const REVIEW_MARKER = "You are a TikZ figure reviewer.";
 
-function reviewMessage({ request, code, compile, lint, edit }) {
+function reviewMessage({ request, code, compile, lint, edit, checks }) {
   const lintLines = (lint.issues || [])
     .slice(0, 10)
     .map((i) => `- [${i.severity}] ${i.code} ${i.where ? i.where + ": " : ""}${i.message} (fix: ${i.fix})`)
@@ -478,6 +479,7 @@ function reviewMessage({ request, code, compile, lint, edit }) {
     "",
     "Static analysis:",
     lintLines || "- none",
+    checks ? 'Canvas and mathematical checks (blocking failures cannot be waived):\n'+JSON.stringify(checks) : '',
     "",
     "Document:",
     FENCE + "latex",
@@ -2072,81 +2074,103 @@ async function* runGenerationInner(opts) {
   const remaining = () => opts.budgetMs - (Date.now() - started);
   yield { type: "budget", limitMs: opts.budgetMs };
   const maxAttempts = Math.max(1, Math.min(6, Number(opts.maxAttempts) || 2));
-  const base = userMessage(opts);
+  const base = userMessage(opts) + (opts.mode === 'edit' && opts.current
+    ? '\nEdit this existing document. Preserve everything not requested to change:\n' + opts.current : '');
   let attempt = 0;
   let code = "";
   let lastCompiled = null;
   let lastVisual = null;
   let best = null;
   const versions = [];
+  const history = [];
   let feedback = "";
   while (attempt < maxAttempts && remaining() > 20_000) {
     attempt++;
     yield { type: "step", id: "generate", label: attempt === 1 ? "生成 TikZ" : "按评审意见修正", status: "running" };
-    let text = base + (feedback ? "\n\nPrevious problems to fix:\n" + feedback.slice(0, 800) : "");
+    let text = base + (feedback ? "\n\nRepair this previous generated document, preserving correct elements:\n" + code + "\n\nProblems to fix:\n" + feedback.slice(0, 6000) : "");
+    if (!opts.image) text += '\nFor mathematical diagrams, compute and verify the actual geometric relationships before drawing. For the mean value theorem, select a,b, compute the secant slope, solve for an interior xi with the same derivative, mark that point, and draw its tangent parallel to the chord. A formula label alone is not evidence. Use explicit drawable primitives and evaluable function expressions.';
     let out;
     try {
       out = await chat({
         apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, signal: opts.signal,
-        temperature: 0.2, maxTokens: 4096, timeoutMs: Math.max(30_000, Math.min(120_000, remaining())),
+        temperature: 0.2, thinking: 'disabled', maxTokens: 4096, timeoutMs: Math.max(30_000, Math.min(120_000, remaining())),
         messages: [
-          { role: "system", content: COMMON_RULES.join("\n") },
+          { role: "system", content: COMMON_RULES },
           { role: "user", content: text },
         ],
       });
     } catch (err) {
-      yield { type: "done", ok: false, code: "", errors: [{ line: null, message: String(err.message || err) }], reason: "COMPILE_FAILED", model: opts.model, attempts: attempt, rounds: attempt, durationMs: Date.now() - started };
+      yield { type: 'step', id: 'generate', status: 'fail', detail: String(err.message || err) };
+      yield { type: "done", ok: false, code: "", errors: [{ line: null, message: String(err.message || err) }], reason: err.code || "GENERATION_FAILED", model: opts.model, attempts: attempt, rounds: attempt, durationMs: Date.now() - started };
       yield { type: "end" };
       return;
     }
     code = ensureDocument(extractCode(out.text));
+    lastVisual = null;
+    yield { type: 'step', id: 'generate', status: 'ok' };
     yield { type: "code", code };
     yield { type: "step", id: "compile", label: "编译校验", status: "running" };
     const compiled = await compileAndRender(code, opts.engine || "xelatex", opts.signal, Math.max(20_000, Math.min(60_000, remaining())));
     lastCompiled = compiled;
     yield { type: "step", id: "compile", status: compiled.ok ? "ok" : "fail", detail: compiled.ok ? undefined : compiled.errors.length + " 个错误" };
     versions.push({ round: attempt, recall: null, precision: null, problems: (compiled.errors || []).length, chars: code.length, compiled: Boolean(compiled.ok), score: null, kind: attempt === 1 ? "initial" : "exploit" });
+    const record = {round: attempt, code, compile: {ok: compiled.ok, errors: compiled.errors || []}};
+    history.push(record);
     if (!compiled.ok) {
       feedback = (compiled.errors || []).map((e) => e.message).join("; ");
       continue;
     }
+    let checks = {ok:true,issues:[]};
+    if (!opts.image) {
+      try { checks = await validateTextFigure(code, opts.prompt || '', opts.canvasMode !== false); }
+      catch (err) { checks = {ok:false,issues:[{code:'VALIDATION_UNAVAILABLE',message:String(err.message || err)}]}; }
+      yield {type:'step', id:'canvas-math', label:'画布与数学关系校验', status:checks.ok?'ok':'fail', detail:checks.ok?'校验通过':checks.issues.map(i=>i.message).join('; ')};
+    }
+    record.checks = checks;
     if (opts.reviewer !== false && remaining() > 15_000) {
-      yield { type: "step", id: "visual", label: "渲染回查", status: "running" };
+      yield { type: "step", id: "visual", label: opts.image ? "渲染回查" : "按文字要求审核", status: "running" };
       try {
-        lastVisual = await compareVision({ source: code, image: opts.image, apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, engine: opts.engine || "xelatex", signal: opts.signal, renderedImage: compiled.png });
+        if (opts.image) {
+          lastVisual = await compareVision({ source: code, image: opts.image, apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, engine: opts.engine || "xelatex", signal: opts.signal, renderedImage: compiled.png });
+        } else {
+          // Text generation has no reference image. Reuse the dedicated text
+          // reviewer, checking the request, code, compile and static findings.
+          const response = await chat({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, signal: opts.signal,
+            temperature: 0, thinking: 'disabled', maxTokens: 1600, timeoutMs: Math.max(1, Math.min(45000, remaining())),
+            messages: [{role: 'system', content: REVIEWER_SYSTEM}, {role: 'user', content: reviewMessage({request: opts.prompt, code, compile: compiled, lint: lintTikz(code), checks})}] });
+          const review = parseReview(response.text);
+          if (!review) throw new Error('文字审核返回的格式无效');
+          lastVisual = {...review, pass: review.verdict === 'pass'};
+        }
         yield { type: "step", id: "visual", status: lastVisual.pass ? "ok" : "fail", detail: lastVisual.score + " 分" };
       } catch (err) {
         lastVisual = null;
         yield { type: "step", id: "visual", status: "fail", detail: String(err.message).slice(0, 60) };
       }
     }
-    const candidate = { code, compiled, visual: lastVisual, geometry: null };
-    const scoreOf = (c) => (c.visual && typeof c.visual.score === "number" ? c.visual.score : -1) * 1000;
+    record.review = lastVisual;
+    const candidate = { code, compiled, visual: lastVisual, geometry: null, checks };
+    const scoreOf = (c) => (c.checks.ok ? 10_000_000 : 0) + (c.visual?.pass === true ? 1_000_000 : 0) + (c.visual && typeof c.visual.score === "number" ? c.visual.score : -1) * 1000;
     if (!best || scoreOf(candidate) > scoreOf(best)) best = candidate;
     const v = versions[versions.length - 1];
     if (v) v.score = lastVisual && typeof lastVisual.score === "number" ? lastVisual.score : null;
-    if (lastVisual && lastVisual.pass) break;
-    if (!lastVisual) break;
+    if (checks.ok && (lastVisual?.pass || opts.reviewer === false)) break;
+    if (checks.ok && !lastVisual) break;
     if (attempt >= maxAttempts) break;
-    feedback = ((lastVisual.issues || []).map((i) => (i.where ? i.where + ": " : "") + i.message).join("; ") + " " + (lastVisual.instructions || "")).slice(0, 800);
+    feedback = JSON.stringify(checks.issues) + '\n' + ((lastVisual?.issues || []).map((i) => (i.where ? i.where + ": " : "") + i.message).join("; ") + " " + (lastVisual?.instructions || ""));
   }
-  const final = best || { code, compiled: lastCompiled, visual: lastVisual, geometry: null };
-  const logId = await logAttempt({ code: final.code || "", mode: opts.mode || "text", perPanel: opts.perPanel, panelIndex: opts.panelIndex, attempt, model: opts.model, compile: final.compiled, durationMs: Date.now() - started });
+  const final = best || { code, compiled: lastCompiled, visual: lastVisual, geometry: null, checks:{ok:false,issues:[]} };
+  const logId = await logAttempt({ code: final.code || "", mode: opts.mode || "text", perPanel: opts.perPanel, panelIndex: opts.panelIndex, attempt, model: opts.model, compile: final.compiled, reconstruction:{history,checks:final.checks,review:final.visual}, durationMs: Date.now() - started });
   if (logId) yield { type: "log", logId };
-  const visualOk = !final.visual || final.visual.pass !== false;
-  const ok = Boolean(final.compiled && final.compiled.ok) && visualOk;
+  const visualOk = opts.reviewer === false || final.visual?.pass === true;
+  const ok = Boolean(final.compiled && final.compiled.ok) && visualOk && final.checks.ok;
   yield {
     type: "done", ok, code: final.code,
-    errors: (final.compiled && final.compiled.errors) || [],
-    reason: ok ? undefined : (!visualOk ? "REVIEW_REJECTED" : "COMPILE_FAILED"),
+    errors: [...((final.compiled && final.compiled.errors) || []), ...final.checks.issues.map(i=>({line:null,message:i.message}))],
+    reason: ok ? undefined : (!final.compiled?.ok ? "COMPILE_FAILED" : !final.checks.ok ? 'FIGURE_VALIDATION_FAILED' : !final.visual ? "REVIEW_UNAVAILABLE" : "REVIEW_REJECTED"),
     model: opts.model, attempts: attempt, rounds: attempt, representation: opts.representation || "native",
-    versions, geometry: null,
+    versions, geometry: null, checks:final.checks,
     visual: final.visual ? { score: final.visual.score, pass: final.visual.pass, issues: final.visual.issues } : null,
-    curves: (reportModel && reportModel.curves || []).map((c) => ({ id: c.id, name: c.name, points: Array.isArray(c.points) ? c.points.length : 0, landmarks: Array.isArray(c.landmarks) ? c.landmarks.length : 0, preservedKinds: c.preservedKinds || [], dropped: c.dropped || 0, candidate: c.candidate ? { kind: c.candidate.kind, family: c.candidate.family, k: c.candidate.k, rmse: c.candidate.rmse } : null })),
-    relations: reportModel && reportModel.relationResult ? { ok: reportModel.relationResult.ok, failures: reportModel.relationResult.failures, checks: reportModel.relationResult.checks, space: reportModel.relationResult.space } : null,
-    yAxis: reportModel && reportModel.yAxis ? { ok: true, rmse: reportModel.yAxis.rmse, source: reportModel.yAxis.source } : null,
-    joint: reportModel && reportModel.joint ? { ok: reportModel.joint.ok, loss: reportModel.joint.loss, terms: reportModel.joint.terms, assignment: reportModel.joint.assignment, relation: reportModel.joint.relation ? { ok: reportModel.joint.relation.ok, failures: reportModel.joint.relation.failures } : null } : null,
-    localReviews: reportModel && Array.isArray(reportModel.localReviews) ? reportModel.localReviews.length : 0,
     durationMs: Date.now() - started,
   };
   yield { type: "end" };

@@ -287,8 +287,8 @@ export function AiDrawer() {
     return () => clearInterval(t);
   }, [running]);
 
-  // Panel detection: multi-panel paper figures are transcribed one panel at a
-  // time, which is far more reliable than asking for everything at once.
+  // Connected components are only crop suggestions, not semantic panels.
+  // Graph boxes and disconnected/dashed edges must remain one scene by default.
   useEffect(() => {
     if (drawer !== "ai" || mode !== "image" || !image) {
       setPanels(null);
@@ -404,7 +404,7 @@ export function AiDrawer() {
           });
         }
         if (ev.type === "done") {
-          if (!ev.ok || !ev.code) throw new Error(ev.reason === "TIMEOUT" ? "此面板达到时间上限" : "模型未交付可编译的完整面板");
+          if (!ev.ok || !ev.code) throw new Error(ev.reason === "TIMEOUT" || ev.reason === "TIME_BUDGET" ? "此面板达到时间上限" : `此分块未通过检查（${ev.reason || "未返回有效结果"}）`);
           out = ev.code;
         }
       },
@@ -504,7 +504,8 @@ export function AiDrawer() {
   }
 
   async function run(override?: { model?: string; auto?: boolean; edit?: boolean }) {
-    if (!override?.edit && !override?.auto && mode === "image" && panels && panels.length >= 2) return runPanels();
+    // The primary action always sends the complete source. Splitting is an
+    // explicit opt-in: component count cannot identify connected graph states.
     if (!ready) return setFailure("未配置 API Key。请先到「设置 → API」填入密钥。");
     const editing = Boolean(override?.edit);
     if (editing && !source.trim()) return setFailure("编辑器里还没有 TikZ 文档。");
@@ -1047,17 +1048,18 @@ export function AiDrawer() {
                 }}
               />
               {panels && panels.length >= 2 && fidelity === "editable" && (
-                <div className="notice" style={{ padding: "8px 10px", alignItems: "center" }}>
+                <details className="notice" style={{ display: "block", padding: "8px 10px" }}>
+                  <summary style={{ cursor: "pointer" }}>可选：独立子图分块识别</summary>
                   <span style={{ flex: 1, fontSize: 11.5 }}>
-                    检测到 <b>{panels.length}</b> 个面板。成功的面板会立即保留，整图最多等待 3 分钟。
+                    发现 <b>{panels.length}</b> 个候选区域，不一定是独立子图。默认整图识别；关系图、连线跨框或共享标注的图片请使用下方「理解并生成 TikZ」。仅对互不关联的子图使用分块。
                   </span>
                   <button className="btn" style={{ height: 26, fontSize: 11.5 }} disabled={running} onClick={() => void runPanels()}>
-                    逐块识别（{panels.length} 块）
+                    按独立子图分块（{panels.length} 块）
                   </button>
                   {result?.panelsDone !== undefined && result.panelsDone < panels.length && (
                     <button className="btn" disabled={running} onClick={() => void runPanels(true)}>重试未完成面板</button>
                   )}
-                </div>
+                </details>
               )}
 
               {vision === "no" && (
@@ -1185,7 +1187,7 @@ export function AiDrawer() {
           >
             {running ? <Loader2 size={14} className="spin" /> : <Sparkles size={14} />}
             {running
-              ? `${mode === "image" && fidelity === "high" ? "矢量化" : panels?.length ? `逐块识别 ${panels.length} 块` : mode === "image" ? "理解并生成" : "生成中"}… ${Math.floor(elapsed / 1000)}s`
+              ? `${mode === "image" && fidelity === "high" ? "矢量化" : mode === "image" ? "理解并生成" : "生成中"}… ${Math.floor(elapsed / 1000)}s`
               : mode === "image" && fidelity === "high"
                 ? "高保真还原"
                 : mode === "image"
@@ -1286,6 +1288,8 @@ export function AiDrawer() {
                       ? "几何核对未通过"
                     : result.reason === "SCENE_REJECTED"
                       ? "图形结构校验未通过"
+                    : result.reason === "FIGURE_VALIDATION_FAILED"
+                      ? "画布或数学关系校验未通过"
                     : result.reason === "REVIEW_UNAVAILABLE"
                       ? "未取得有效视觉评审"
                     : result.reason === "APPROXIMATION_REQUIRED"
@@ -1312,7 +1316,7 @@ export function AiDrawer() {
               </div>
 
               {visualReview && <div className={visualReview.pass ? "hint" : "notice notice--warn"} style={{ display: "grid", gap: 4 }}>
-                <span>原图对照：{visualReview.score} 分 · {visualReview.pass ? "通过" : "需要修正"}</span>
+                <span>{mode === 'image' ? '原图对照' : '需求审核'}：{visualReview.score} 分 · {visualReview.pass ? "通过" : "需要修正"}</span>
                 {visualReview.issues.map((issue, i) => <span key={i}>{issue.message}</span>)}
               </div>}
 

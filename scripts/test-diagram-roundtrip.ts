@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';
+import {diagramFixture} from './test-diagram-scene.mjs';
+import {sceneFromPixels,compileScene} from '../server/scene.mjs';
+import {parseBodySafe,buildDocument} from '../src/lib/figure/bridge';
+const {code}=compileScene(sceneFromPixels(diagramFixture,600,300),{width:600,height:300});
+const parsed=parseBodySafe(code);assert.ok(parsed);
+const saved=buildDocument(parsed),again=parseBodySafe(saved);assert.ok(again);
+assert.equal(again.elements.length,parsed.elements.length,'save/reopen must retain graph primitives');
+assert.ok(saved.includes("X'_U"));assert.ok(saved.includes('Y_2^W'));
+const response=await fetch((process.env.TEST_SERVER||'http://127.0.0.1:8788')+'/api/compile',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({source:saved,engine:'xelatex'})});
+const result=await response.json();assert.ok(result.ok,JSON.stringify(result.errors));
+console.log('diagram canvas roundtrip and project TeX compilation passed; '+again.elements.length+' editable primitives');

@@ -462,7 +462,7 @@ export function displayText(text: string): string {
   let s = t
     .replace(/\\(small|footnotesize|scriptsize|tiny|normalsize|large|Large|LARGE|huge|Huge|bfseries|itshape|slshape|scshape|ttfamily|rmfamily|sffamily|selectfont)/g, "")
     .replace(/\\[()\[\]]/g, "")
-    .replace(/\\frac\{([^{}]*)\}\{([^{}]*)\}/g, "$1/$2")
+    .replace(/\\(?:dfrac|tfrac|frac)\{([^{}]*)\}\{([^{}]*)\}/g, "($1)/($2)")
     .replace(/\\([a-zA-Z]+)/g, (_m, name: string) => GREEK[name] ?? name)
     .replace(/\$/g, "")
     .replace(/\s+/g, " ")

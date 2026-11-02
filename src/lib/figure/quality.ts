@@ -6,6 +6,7 @@ export interface FigureIssue { severity: "blocker" | "major" | "minor"; code: st
 /** Geometric checks independent of a language model's self-assessment. */
 export function assessFigure(fig: Figure): { ok: boolean; issues: FigureIssue[] } {
   const issues: FigureIssue[] = [];
+  for(const message of fig.parseErrors||[])issues.push({severity:'blocker',code:'CANVAS_PARSE',message});
   if (!fig.elements.length) issues.push({ severity: "blocker", code: "EMPTY", message: "没有可编辑元素" });
   if (fig.elements.length > (fig.viewport ? 1800 : 500)) issues.push({ severity: "blocker", code: "REPETITION", message: "元素数量异常，可能重复生成" });
   const boxes = fig.elements.map(el => ({ el, b: bboxOf(el) }));

@@ -1,9 +1,10 @@
 import type { BezierEl, CircleEl, Element, EllipseEl, Figure, LineEl, NodeEl, PlotEl, PolyEl, Pt, RectEl, Style, AxesEl } from "./types";
 import { COLORS, defaultStyle, elementLabel, uid } from "./types";
 import { pgfmathToJs } from "./pgfmath";
+import { normalizeCoordinates } from './coordinates';
 import { splitOptions, colorToHex, colorDefinitions } from "./colors";
 
-const NUM = "(-?\\d+(?:\\.\\d+)?)";
+const NUM = "(-?\\d+(?:\\.\\d+)?(?:[eE][+-]?\\d+)?)";
 // pgfmath allows braces around coordinates: (3,{2.6}) — accept both forms.
 const P = `\\(\\s*\\{?\\s*${NUM}\\s*\\}?\\s*,\\s*\\{?\\s*${NUM}\\s*\\}?\\s*\\)`;
 
@@ -158,7 +159,7 @@ export function parseBody(body: string, options?: { pictureOptions?: string }): 
   };
 
   for (const raw of lines) {
-    const line = raw.trim();
+    const line = normalizeCoordinates(raw.trim());
     if (!line) continue;
     if (line.startsWith("%")) {
       if (line.startsWith("% @ocr ")) {
@@ -175,12 +176,14 @@ export function parseBody(body: string, options?: { pictureOptions?: string }): 
     const coord = /^\\coordinate\s*\(([^)]*)\)\s*at\s*\(([^)]*)\)\s*;\s*$/.exec(line);
     if (coord) {
       const c = coord[2].split(",").map((p) => p.replace(/[{}]/g, "").trim());
+      if(c.length!==2||c.some(v=>!v||!Number.isFinite(Number(v)))){parseErrors.push('invalid coordinate: '+coord[2]);continue;}
       nodeNames.set(coord[1].trim(), { x: num(c[0]), y: num(c[1]), w: 0, h: 0 });
       continue;
     }
 
     if (line.startsWith("\\tikzset") || line.startsWith("\\tikzstyle")) continue;
     if (line.startsWith("\\foreach") || line.startsWith("\\usetikzlibrary") || line.startsWith("\\begin") || line.startsWith("\\end")) {
+      if(line.startsWith('\\foreach')||/^\\begin\{scope\}\[/.test(line))parseErrors.push('unsupported canvas statement: '+line.slice(0,100));
       continue;
     }
 
@@ -189,6 +192,7 @@ export function parseBody(body: string, options?: { pictureOptions?: string }): 
       const opts = nodeMatch[1] ?? "";
       const nodeName = (nodeMatch[2] ?? "").trim();
       const c = nodeMatch[3].split(",").map((part) => part.replace(/[{}]/g, "").trim());
+      if(c.length!==2||c.some(v=>!v||!Number.isFinite(Number(v)))){parseErrors.push('invalid node coordinate: '+nodeMatch[3]);continue;}
       // Keep $...$ intact: stripping it here made the regenerated TikZ lose the
       // maths delimiters and fail with "Missing $ inserted".
       const text = nodeMatch[4];
@@ -242,17 +246,18 @@ export function parseBody(body: string, options?: { pictureOptions?: string }): 
     }
 
     const drawMatch = DRAW_RE.exec(line);
-    if (!drawMatch) continue;
+    if (!drawMatch) {if(/^\\(?:node|fill|draw|clip|path)\b/.test(line)&&!/^\\path\[use as bounding box\]/.test(line))parseErrors.push('unparsed canvas statement: '+line.slice(0,100));continue;}
     const command = drawMatch[1];
     const opts = expandStyles(drawMatch[2] ?? "");
     // Resolve named coordinates: (in) -- (mid) becomes (0,0) -- (4,0).
     const rest = drawMatch[3]
       .trim()
       .replace(/\(([^)]*)\)/g, (m, inner) => {
+        if(/^plot\b/.test(drawMatch[3].trim())||/^\s*-?[\d.eE+-]+\s*(?:pt|cm|mm)?\s*$/.test(inner)||/\band\b/.test(inner))return m;
         // "(n1.east)" is a node plus an anchor. Names may contain dots, so split on
         // the last segment only when it is a known anchor word.
         // Plain coordinates are not node references.
-        if (/^\s*-?[\d.]+\s*,\s*-?[\d.]+\s*$/.test(inner)) return m;
+        if (/^\s*-?[\d.eE+-]+\s*,\s*-?[\d.eE+-]+\s*$/.test(inner)) return m;
         const parts = inner.split(".");
         const anchorWords = /^(east|west|north|south|center|north east|north west|south east|south west|base|mid|text|inner sep)$/;
         let n = inner.trim();
@@ -325,7 +330,7 @@ export function parseBody(body: string, options?: { pictureOptions?: string }): 
     // plot[smooth] coordinates {...}
     if (/^plot\b/.test(rest)) {
       const coords = [...rest.matchAll(/\((-?[\d.]+),\s*(-?[\d.]+)\)/g)].map((m) => ({ x: Number(m[1]), y: Number(m[2]) }));
-      if (coords.length < 2) continue;
+      if (coords.length < 2) {parseErrors.push('unparsed plot coordinates: '+line.slice(0,100));continue;}
       if (!pendingPlotExpr) {
         elements.push({ id: uid("pg"), kind: "poly", name: nextName("poly"), points: coords, closed: /cycle/.test(rest), smooth: /smooth/.test(rest), style });
         continue;
@@ -538,8 +543,10 @@ export function parseBody(body: string, options?: { pictureOptions?: string }): 
           style,
         };
         elements.push(el);
+        continue;
       }
     }
+    parseErrors.push('unparsed canvas path: '+line.slice(0,160));
   }
 
   // Pair a horizontal axis with a vertical one. They do not have to start at the

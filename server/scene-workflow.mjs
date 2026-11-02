@@ -4,14 +4,15 @@ import { logAttempt } from './ailog.mjs';
 import { refineScene, compactSceneCurves } from './scene-fit.mjs';
 import { reconstructPanels } from './scene-panels.mjs';
 import { checkSceneGeometry } from './scene-geometry-check.mjs';
+import { auditDiagramEdges } from './diagram-audit.mjs';
 
 function modelFeedbackScene(scene,width,height){
   const pixels=sceneToPixels(scene,width,height);
   // Derived UV/fit diagnostics must not masquerade as source-pixel geometry
   // in the next model response. Keep only the public semantic object protocol.
-  const derived=['fit','fitDiagnostics','plotCoordinates','frameId','frameAnchor','endpointAnchors','sourceEndpoints','referenceMeasurement','pointBudget'];
+  const derived=['fit','fitDiagnostics','plotCoordinates','frameId','frameAnchor','endpointAnchors','sourceEndpoints','referenceMeasurement','pointBudget','portEvidence'];
   for(const o of pixels.objects)for(const key of derived)delete o[key];
-  for(const key of ['plotFrames','coordinateAnchors','coordinateReport','geometryReport','sourceSize','budgetRegions','partition'])delete pixels[key];
+  for(const key of ['plotFrames','coordinateAnchors','coordinateReport','geometryReport','diagramAudit','diagramReport','sourceSize','budgetRegions','partition'])delete pixels[key];
   return pixels;
 }
 
@@ -33,7 +34,7 @@ export async function* runSceneGeneration(opts,services){
       yield {type:'step',id,label:round===1?'识别图形结构与对象':'按评审修复场景',status:'running',detail:'保留折线、曲面区域、图例、独立坐标系和面板布局'};
       let scene,built;
       try{
-        if(round>1 && remaining()>70000 && (raster.w/raster.h>1.7 || raster.w>900)){
+        if(round>1 && best?.scene?.type!=='diagram' && remaining()>70000 && (raster.w/raster.h>1.7 || raster.w>900)){
           yield {type:'step',id:'partition',label:'检查面板与共享图例分区',status:'running'};
           try{
             scene=await reconstructPanels({...opts,signal:controller.signal},raster,services);
@@ -78,10 +79,20 @@ export async function* runSceneGeneration(opts,services){
             }
           }
         }
+        if(scene.type==='diagram'&&scene.objects.some(o=>o.diagramEdge)){
+          yield {type:'step',id:'diagram-audit',label:'逐边核对原图连接关系',status:'running'};
+          try{
+            if(remaining()<20000)throw Error('Insufficient budget for graph inventory');
+            scene=await auditDiagramEdges(scene,raster,{...opts,signal:controller.signal,timeoutMs:Math.min(45000,remaining()-12000)},services);
+            yield {type:'step',id:'diagram-audit',status:scene.diagramAudit.ok?'ok':'fail',detail:scene.diagramAudit.ok?scene.diagramAudit.edges+' 条连接按原图重新核对':JSON.stringify(scene.diagramAudit.issues)};
+          }catch(e){scene.diagramAudit={ok:false,issues:[e.message]};yield {type:'step',id:'diagram-audit',status:'fail',detail:e.message};}
+        }
         if(!scene.partition)scene=refineScene(scene,raster);
         if(scene.relationEvidence)yield {type:'step',id:'crossing-evidence',label:'原图局部交点证据核验',status:scene.relationEvidence.rejected.length?'fail':'ok',
           detail:scene.relationEvidence.accepted+' 个通过核验 · '+scene.relationEvidence.rejected.length+' 个未证实，不作为拟合约束'};
         scene.geometryReport=checkSceneGeometry(scene,raster);
+        if(scene.type==='diagram')yield {type:'step',id:'diagram-topology',label:'关系图节点与连线校验',status:scene.geometryReport.diagram.ok?'ok':'fail',
+          detail:scene.geometryReport.diagram.vertices+' 个点节点 · '+scene.geometryReport.diagram.edges+' 条锚定连线'};
         yield {type:'step',id:'geometry-check',label:'端点、峰谷、交点与边界校验',status:scene.geometryReport.ok?'ok':'fail',
           detail:scene.geometryReport.ok?'最终曲线与结构约束一致':JSON.stringify(scene.geometryReport.issues.slice(0,2))};
         if(scene.coordinateAnchors?.length)yield {type:'step',id:'coordinate-anchors',label:'原图坐标轴与刻度定位',status:'ok',
@@ -116,13 +127,16 @@ export async function* runSceneGeneration(opts,services){
             unresolvedStructure:o.fitDiagnostics.unresolvedStructure,worstResidualTerms:o.fitDiagnostics.worstResidualTerms}));
       const coordinateIssues=scene.coordinateReport?.ok===false?['Plot coordinate calibration is incomplete or inconsistent.']:[];
       const geometryIssues=(scene.geometryReport?.issues||[]).map(issue=>'Final geometry constraint failed: '+JSON.stringify(issue));
+      if(scene.diagramAudit?.ok===false)geometryIssues.push('Diagram source edge inventory not verified: '+JSON.stringify(scene.diagramAudit.issues));
       const limitations=[...(Array.isArray(scene.limitations)?scene.limitations:[]),...fitIssues,...coordinateIssues,...geometryIssues];
-      const ok=Boolean(compiled.ok&&visual?.pass&&scene.fidelity!=='approximate'&&!fitIssues.length&&!coordinateIssues.length&&!geometryIssues.length);
+      const reviewAccepted=opts.reviewer===false||visual?.pass===true;
+      const ok=Boolean(compiled.ok&&reviewAccepted&&scene.fidelity!=='approximate'&&!fitIssues.length&&!coordinateIssues.length&&!geometryIssues.length);
       const residuals=scene.objects.map(o=>o.fitDiagnostics).filter(d=>d?.before).map(d=>
         d.status==='kept-model'?d.before.rmse:d.best?.rmse??d.before.rmse);
       const coordinatePenalty=residuals.length?Math.min(99,residuals.reduce((a,b)=>a+b,0)/residuals.length)*.001:0;
       const relationFailures=(scene.geometryReport?.issues||[]).filter(i=>i.kind.includes('crossing')).length;
-      const rank=(ok?10000:compiled.ok?1000:0)+(visual?.score||0)-coordinatePenalty-Math.min(180,30*relationFailures);
+      const diagramFailures=scene.diagramAudit?.ok===false?Math.max(1,scene.diagramAudit.issues?.length||0):0;
+      const rank=(ok?10000:compiled.ok?1000:0)+(visual?.score||0)-coordinatePenalty-Math.min(180,30*(relationFailures+diagramFailures));
       const candidate={scene,built,compiled,visual,round,ok,rank,limitations};
       versions.push({round,score:visual?.score??null,compiled:compiled.ok,ok,rank,kind:round===1?'initial':'repair'});
       if(!best||rank>best.rank)best=candidate;

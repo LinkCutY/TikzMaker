@@ -3,6 +3,7 @@ import { monotoneCubics } from './scene.mjs';
 import { plotDataValue, toPlot } from './plot-frame.mjs';
 import { clipCubics, linearCubics, stepPoints } from './curve-clip.mjs';
 import { vectorCrossings } from './vector-crossings.mjs';
+import { checkDiagramConnections } from './diagram-scene.mjs';
 const cubic=(a,b,c,d,t)=>(1-t)**3*a+3*(1-t)**2*t*b+3*(1-t)*t*t*c+t**3*d;
 function geometry(o){
   if(o.connection==='bezier')return {start:o.start,segments:o.segments};
@@ -86,5 +87,6 @@ export function checkSceneGeometry(scene,raster){
       }
     }
   }
-  return {ok:issues.length===0,issues,series,crossings};
+  const diagram=checkDiagramConnections(scene);issues.push(...diagram.issues);
+  return {ok:issues.length===0,issues,series,crossings,diagram};
 }

@@ -1,0 +1,42 @@
+import assert from 'node:assert/strict';
+import {locateDiagramVertices,straightEdgeEvidence,diagramLineCandidates,refineDiagramPorts} from '../server/diagram-evidence.mjs';
+import {auditDiagramEdges} from '../server/diagram-audit.mjs';
+import {sceneFromPixels} from '../server/scene.mjs';
+const raster={w:220,h:160,rgb:new Uint8Array(220*160*3).fill(255)};
+// Analytic fixture, including an unconnected dot and an interrupted edge.
+for(let y=0;y<160;y++)for(let x=0;x<220;x++){
+  const dot=[[30,30],[190,30],[30,130],[190,130]].some(p=>Math.hypot(x-p[0],y-p[1])<=3);
+  const solid=x>=30&&x<=190&&Math.abs(y-30)<1;
+  const dashed=x>=30&&x<=190&&Math.abs(y-130)<1&&x%12<5;
+  if(dot||solid||dashed)raster.rgb.fill(0,3*(y*220+x),3*(y*220+x)+3);
+}
+const nodes=[[32,32],[188,32],[32,128],[188,128]].map((p,i)=>({id:'n'+i,kind:'path',role:'node',connection:'none',points:[p],marker:{shape:'circle',radiusPx:3},style:{stroke:'#000000'}}));
+const located=locateDiagramVertices(nodes,raster);
+assert.ok(located.report.every(n=>n.supported));
+assert.ok(Math.hypot(...located.objects[0].points[0].map(v=>v-30))<2);
+assert.equal(straightEdgeEvidence([30,30],[190,30],[],raster).status,'supported');
+assert.equal(straightEdgeEvidence([30,130],[190,130],[],raster).status,'supported');
+assert.equal(straightEdgeEvidence([30,30],[190,130],[],raster).status,'unsupported');
+assert.equal(diagramLineCandidates(located.objects,raster).length,2);
+const rectRaster={w:500,h:320,rgb:new Uint8Array(500*320*3).fill(255)};
+for(let y=0;y<320;y++)for(let x=0;x<500;x++)if((x>=50&&x<=130&&(y===70||y===100))||(y>=70&&y<=100&&(x===50||x===130)))rectRaster.rgb.fill(0,3*(y*500+x),3*(y*500+x)+3);
+const moved=locateDiagramVertices([{id:'box',kind:'rect',box:[50,56,80,30]}],rectRaster).objects[0];
+assert.ok(Math.abs(moved.box[1]-70)<2&&Math.abs(moved.box[3]-30)<2,'joint border fit must not collapse opposite sides onto one border');
+const portsRaster={w:200,h:160,rgb:new Uint8Array(200*160*3).fill(255)};
+for(let y=55;y<=105;y++)portsRaster.rgb.fill(0,3*(y*200+100),3*(y*200+100)+3);
+const groups=[{id:'top',kind:'rect',box:[50,20,100,35]},{id:'bottom',kind:'rect',box:[50,105,100,35]}];
+const portEdge={points:[[70,40],[70,120]],diagramEdge:{from:{id:'dotA'},to:{id:'dotB'}}};
+const corrected=refineDiagramPorts(portEdge,groups,portsRaster);
+assert.equal(corrected.diagramEdge.from.id,'top');assert.equal(corrected.diagramEdge.to.id,'bottom');
+assert.ok(corrected.points.every(p=>Math.abs(p[0]-100)<=1),'box-to-box edge must not be forced onto off-centre interior dots');
+const scene=sceneFromPixels({type:'diagram',canvas:{unit:'px',width:220,height:160},objects:nodes},220,160);
+const services=answer=>({chat:async()=>({text:JSON.stringify(answer)}),parseJsonObject:JSON.parse});
+const edge={id:'edge',kind:'edge',from:{id:'n0'},to:{id:'n1'}};
+const verified=await auditDiagramEdges(scene,raster,{image:'test'},services({complete:true,edges:[edge]}));
+assert.equal(verified.diagramAudit.ok,true);
+const wrong=await auditDiagramEdges(scene,raster,{image:'test'},services({complete:true,edges:[{...edge,to:{id:'n3'}}]}));
+assert.equal(wrong.diagramAudit.ok,false,'plausible but unsupported connection cannot pass');
+const incomplete=await auditDiagramEdges(scene,raster,{image:'test'},services({complete:false,issues:['ambiguous'],edges:[]}));
+assert.deepEqual(incomplete.objects,scene.objects,'an incomplete response must preserve the prior scene');
+await assert.rejects(()=>auditDiagramEdges(scene,raster,{image:'test'},services({complete:true,edges:[{...edge,to:{id:'missing'}}]})),/unknown endpoint/);
+console.log('diagram evidence passed: bounded point location, solid/dashed support, false edge rejection, incomplete audit preservation');

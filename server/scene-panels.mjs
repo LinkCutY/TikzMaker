@@ -42,6 +42,7 @@ export function combineRegions(parts,raster){
     }
     for(const o of local.objects){
       o.id='panel-'+i+'-'+o.id;
+      if(o.diagramEdge)o.diagramEdge={from:{...o.diagramEdge.from,id:'panel-'+i+'-'+o.diagramEdge.from.id},to:{...o.diagramEdge.to,id:'panel-'+i+'-'+o.diagramEdge.to.id}};
       if(o.frameId)o.frameId='panel-'+i+'-'+o.frameId;
       if(o.frameAnchor)o.frameAnchor={...o.frameAnchor,axisId:'panel-'+i+'-'+o.frameAnchor.axisId};
       if(o.endpointAnchors)for(const anchor of Object.values(o.endpointAnchors)){
