@@ -22,6 +22,9 @@ type Step = { id: string; label: string; status: "running" | "ok" | "fail"; deta
 
 interface Result {
   ok: boolean;
+  refinement?: AiStreamEvent['refinement'];
+  stopReason?: string;
+  requirements?: {id:string;text:string;objects:string[]}[];
   attempts: number;
   rounds?: number;
   phased?: "budget" | "review" | "stuck";
@@ -549,8 +552,10 @@ export function AiDrawer() {
           baseUrl: settings.apiBaseUrl,
           model,
           canvasMode,
-          // maxAttempts counts the first try plus the corrections.
+          // Image pipelines retain their round limit. Text reworks until
+          // qualification; this setting only counts qualified refinements.
           maxAttempts: Math.max(1, Math.min(6, repairs + 1)),
+          refinementPasses: mode === 'text' ? repairs : undefined,
           engine: settings.engine,
           reviewer,
           representation: mode === "image" ? tracer : undefined,
@@ -601,6 +606,9 @@ export function AiDrawer() {
             if (event.code) setCode(event.code);
             setResult({
               ok: Boolean(event.ok),
+              refinement:event.refinement,
+              stopReason:event.stopReason,
+              requirements: event.checks?.composition?.requirements,
               attempts: event.attempts ?? 1,
               rounds: event.rounds,
               phased: event.timedOut || event.reason === "TIME_BUDGET" || event.reason === "TIMEOUT"
@@ -1158,10 +1166,10 @@ export function AiDrawer() {
             </div>
             <div className="hint">
               开启后每一版都会再过一道审核器：它只判断、不改代码，输出 JSON 结论（问题 + 改法），
-              生成器据此重写。关闭则只用编译报错驱动修复。
+              生成器据此重写。关闭则保留编译与结构检查。
             </div>
             <div className="row row--between" style={{ fontSize: 12 }}>
-              <span>修正次数（0 = 仅校验，编译错误不占）</span>
+              <span>{mode === 'text' ? '合格后优化次数（未合格返工不占次数）' : '修正次数'}</span>
               <input
                 className="input mono"
                 type="number"
@@ -1169,7 +1177,7 @@ export function AiDrawer() {
                 max={5}
                 step={1}
                 value={repairs}
-                title="审核不通过后最多再改几次；编译错误会自动重写且不计入次数，全程上限 5 分钟"
+                title={mode === 'text' ? '0 = 首次合格即结束；未合格持续返工，后续优化也须合格才计数。受本轮时间预算及取消操作限制。' : '图片生成的额外修正轮数'}
                 style={{ width: 62, height: 26, textAlign: "center" }}
                 onChange={(e) => {
                   const next = Number(e.target.value);
@@ -1290,6 +1298,8 @@ export function AiDrawer() {
                       ? "图形结构校验未通过"
                     : result.reason === "FIGURE_VALIDATION_FAILED"
                       ? "画布或数学关系校验未通过"
+                    : result.reason === "COMPOSITION_FAILED"
+                      ? "构图关系未完成，请查看具体原因"
                     : result.reason === "REVIEW_UNAVAILABLE"
                       ? "未取得有效视觉评审"
                     : result.reason === "APPROXIMATION_REQUIRED"
@@ -1320,6 +1330,17 @@ export function AiDrawer() {
                 {visualReview.issues.map((issue, i) => <span key={i}>{issue.message}</span>)}
               </div>}
 
+              {mode === 'text' && result.requirements?.length ? (
+                <details className="notice" style={{marginTop:12}}>
+                  <summary>本次构图理解（{result.requirements.length} 项）</summary>
+                  <ul>{result.requirements.map(r=><li key={r.id}>{r.text}</li>)}</ul>
+                  <span className="hint">请核对是否完整表达了你的要求；构图检查通过不等于所有语义都已理解正确。</span>
+                </details>
+              ) : null}
+              {result.refinement && <div className="hint">
+                {result.refinement.qualified ? '已保留合格版本' : '尚未取得合格版本'}；合格后优化 {result.refinement.completed}/{result.refinement.target}
+                {!result.refinement.complete && result.stopReason ? `（${result.stopReason === 'TIME_BUDGET' ? '剩余时间不足继续返工' : result.stopReason === 'CANCELLED' ? '已取消' : '服务中断'}）` : ''}
+              </div>}
               {editable && (
                 <div className="hint">
                   可编辑元素 {editable.total} 个{editable.kinds ? `（${editable.kinds}）` : ""}

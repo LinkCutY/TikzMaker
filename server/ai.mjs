@@ -29,7 +29,8 @@ import { fitPrintedMarkers, fitReferenceLine, measureOpenAxes } from './plot-obs
 import { fitAnalyticImage, colourDirection } from './analytic-image-fit.mjs';
 import { runSceneGeneration } from './scene-workflow.mjs';
 import { CURVE_BUDGET_PROMPT } from './curve-budget.mjs';
-import { validateTextFigure } from './text-validation.mjs';
+import { validateTextFigure, compileComposition } from './text-validation.mjs';
+import { COMPOSITION_PROMPT, preserveRequirements, preserveConstraints, requirementContract } from './text-composition.mjs';
 
 /** True when the class-specific structural checks passed (the reviewer is separate). */
 function clsOk(gate) {
@@ -425,6 +426,7 @@ const REVIEWER_SYSTEM = [
   "",
   "You receive: the user request, the generated document, the compile result, and static-analysis findings.",
   "Decide whether the figure is deliverable, then emit machine-readable findings.",
+  "If a semantic construction is provided, compare its requirement list against EVERY clause of the original request. Missing objects, wrong counts, reversed arrows, missing labels or substituted functions must be revised even if its internal constraints pass. Judge the actual generated geometry, not just its requirement descriptions.",
   "",
   "Blocking problems (any one => verdict \"revise\"):",
   "- COMPILE_ERROR      the document does not compile",
@@ -2074,6 +2076,9 @@ async function* runGenerationInner(opts) {
   const remaining = () => opts.budgetMs - (Date.now() - started);
   yield { type: "budget", limitMs: opts.budgetMs };
   const maxAttempts = Math.max(1, Math.min(6, Number(opts.maxAttempts) || 2));
+  const textRework = !opts.image;
+  const refinementTarget = Math.max(0, Math.min(5, Math.floor(Number(opts.refinementPasses ?? (maxAttempts - 1)) || 0)));
+  let acceptedCount = 0, reviewCount = 0, generationError = null;
   const base = userMessage(opts) + (opts.mode === 'edit' && opts.current
     ? '\nEdit this existing document. Preserve everything not requested to change:\n' + opts.current : '');
   let attempt = 0;
@@ -2083,29 +2088,57 @@ async function* runGenerationInner(opts) {
   let best = null;
   const versions = [];
   const history = [];
+  const compose = !opts.image && opts.mode !== 'edit' && opts.canvasMode !== false;
+  let composition = null, contract = null, constraintContract = null, constructionError = null;
   let feedback = "";
-  while (attempt < maxAttempts && remaining() > 20_000) {
+  while ((textRework || attempt < maxAttempts) && remaining() > 20_000 && !opts.signal?.aborted) {
     attempt++;
-    yield { type: "step", id: "generate", label: attempt === 1 ? "生成 TikZ" : "按评审意见修正", status: "running" };
+    yield { type: "step", id: "generate", label: attempt === 1 ? (compose ? "理解需求并构图" : "生成 TikZ") : acceptedCount ? "合格后优化 / 返工" : "返工至合格", status: "running", detail:textRework?'第 '+attempt+' 轮 · 合格后优化 '+Math.max(0,acceptedCount-1)+'/'+refinementTarget:undefined };
     let text = base + (feedback ? "\n\nRepair this previous generated document, preserving correct elements:\n" + code + "\n\nProblems to fix:\n" + feedback.slice(0, 6000) : "");
+    if(compose) text = 'User request:\n'+opts.prompt+'\nReturn the semantic construction JSON. Complete every requested object and relationship.'+
+      (composition?'\nPrevious construction to repair:\n'+JSON.stringify(composition):'')+
+      (contract?'\nKeep these original requirements unchanged:\n'+JSON.stringify(contract):'')+
+      (feedback?'\nProblems to fix:\n'+feedback.slice(0,6000):'');
     if (!opts.image) text += '\nFor mathematical diagrams, compute and verify the actual geometric relationships before drawing. For the mean value theorem, select a,b, compute the secant slope, solve for an interior xi with the same derivative, mark that point, and draw its tangent parallel to the chord. A formula label alone is not evidence. Use explicit drawable primitives and evaluable function expressions.';
     let out;
     try {
       out = await chat({
         apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, signal: opts.signal,
-        temperature: 0.2, thinking: 'disabled', maxTokens: 4096, timeoutMs: Math.max(30_000, Math.min(120_000, remaining())),
+        temperature: 0.2, thinking: 'disabled', maxTokens: compose ? 8192 : 4096, timeoutMs: Math.max(1, Math.min(120_000, remaining())),
         messages: [
-          { role: "system", content: COMMON_RULES },
+          { role: "system", content: compose ? COMPOSITION_PROMPT : COMMON_RULES },
           { role: "user", content: text },
         ],
       });
     } catch (err) {
       yield { type: 'step', id: 'generate', status: 'fail', detail: String(err.message || err) };
+      if(best){generationError=err;break;}
       yield { type: "done", ok: false, code: "", errors: [{ line: null, message: String(err.message || err) }], reason: err.code || "GENERATION_FAILED", model: opts.model, attempts: attempt, rounds: attempt, durationMs: Date.now() - started };
       yield { type: "end" };
       return;
     }
-    code = ensureDocument(extractCode(out.text));
+    if(compose){
+      yield {type:'step',id:'composition',label:'按对象与关系构图',status:'running'};
+      try{
+        composition=parseJsonObject(out.text);
+        if(!composition||composition.unsupported)throw new Error(composition?.unsupported||'需要有效的构图 JSON');
+        preserveRequirements(composition,contract);
+        contract ||= requirementContract(composition);
+        preserveConstraints(composition,constraintContract);
+        if(!constraintContract&&Array.isArray(composition.constraints)&&composition.constraints.every(c=>c&&['parallel','perpendicular','equalLength','onCurve','leftOf','above'].includes(c.kind)))constraintContract=structuredClone(composition.constraints);
+        const built=await compileComposition(composition);
+        contract ||= structuredClone(built.requirements);
+        constraintContract ||= structuredClone(composition.constraints);
+        code=built.code;constructionError=null;
+        yield {type:'step',id:'composition',status:'ok',detail:built.requirements.length+' 项需求 · '+built.figure.elements.length+' 个图元 · '+built.constraints.length+' 项关系'};
+      }catch(err){
+        constructionError=String(err.message||err);feedback=constructionError;
+        history.push({round:attempt,composition,constructionError});
+        yield {type:'step',id:'composition',status:'fail',detail:constructionError};
+        yield {type:'step',id:'generate',status:'fail',detail:'构图关系需修正'};
+        continue;
+      }
+    }else code = ensureDocument(extractCode(out.text));
     lastVisual = null;
     yield { type: 'step', id: 'generate', status: 'ok' };
     yield { type: "code", code };
@@ -2114,7 +2147,7 @@ async function* runGenerationInner(opts) {
     lastCompiled = compiled;
     yield { type: "step", id: "compile", status: compiled.ok ? "ok" : "fail", detail: compiled.ok ? undefined : compiled.errors.length + " 个错误" };
     versions.push({ round: attempt, recall: null, precision: null, problems: (compiled.errors || []).length, chars: code.length, compiled: Boolean(compiled.ok), score: null, kind: attempt === 1 ? "initial" : "exploit" });
-    const record = {round: attempt, code, compile: {ok: compiled.ok, errors: compiled.errors || []}};
+    const record = {round: attempt, code, composition, compile: {ok: compiled.ok, errors: compiled.errors || []}};
     history.push(record);
     if (!compiled.ok) {
       feedback = (compiled.errors || []).map((e) => e.message).join("; ");
@@ -2126,8 +2159,10 @@ async function* runGenerationInner(opts) {
       catch (err) { checks = {ok:false,issues:[{code:'VALIDATION_UNAVAILABLE',message:String(err.message || err)}]}; }
       yield {type:'step', id:'canvas-math', label:'画布与数学关系校验', status:checks.ok?'ok':'fail', detail:checks.ok?'校验通过':checks.issues.map(i=>i.message).join('; ')};
     }
+    if(compose)checks.composition={requirements:contract,objects:composition.objects,constraints:composition.constraints};
     record.checks = checks;
     if (opts.reviewer !== false && remaining() > 15_000) {
+      reviewCount++;
       yield { type: "step", id: "visual", label: opts.image ? "渲染回查" : "按文字要求审核", status: "running" };
       try {
         if (opts.image) {
@@ -2154,21 +2189,33 @@ async function* runGenerationInner(opts) {
     if (!best || scoreOf(candidate) > scoreOf(best)) best = candidate;
     const v = versions[versions.length - 1];
     if (v) v.score = lastVisual && typeof lastVisual.score === "number" ? lastVisual.score : null;
-    if (checks.ok && (lastVisual?.pass || opts.reviewer === false)) break;
-    if (checks.ok && !lastVisual) break;
-    if (attempt >= maxAttempts) break;
+    const qualified=checks.ok && (lastVisual?.pass === true || opts.reviewer === false);
+    if(textRework){
+      if(qualified){
+        acceptedCount++;
+        yield {type:'step',id:'qualification',label:'合格与优化进度',status:'ok',detail:'已合格 · 后续合格优化 '+Math.max(0,acceptedCount-1)+'/'+refinementTarget};
+        if(acceptedCount>=1+refinementTarget)break;
+        feedback='This version passed all enabled checks. Preserve all requirements and correct geometry. Improve readability, label placement and spacing without changing mathematical relationships. Return the complete revised result; it must pass the same checks again.';
+        continue;
+      }
+    }else{
+      if(qualified || !lastVisual || attempt>=maxAttempts)break;
+    }
     feedback = JSON.stringify(checks.issues) + '\n' + ((lastVisual?.issues || []).map((i) => (i.where ? i.where + ": " : "") + i.message).join("; ") + " " + (lastVisual?.instructions || ""));
+    if(!lastVisual&&opts.reviewer!==false)feedback+='\nNo valid review was obtained. The figure is NOT qualified; retain its requirements and retry generation/review.';
   }
-  const final = best || { code, compiled: lastCompiled, visual: lastVisual, geometry: null, checks:{ok:false,issues:[]} };
-  const logId = await logAttempt({ code: final.code || "", mode: opts.mode || "text", perPanel: opts.perPanel, panelIndex: opts.panelIndex, attempt, model: opts.model, compile: final.compiled, reconstruction:{history,checks:final.checks,review:final.visual}, durationMs: Date.now() - started });
+  const final = best || { code, compiled: lastCompiled, visual: lastVisual, geometry: null, checks:{ok:false,issues:constructionError?[{code:'COMPOSITION_FAILED',message:constructionError}]:[]} };
+  const stopReason=opts.signal?.aborted?'CANCELLED':generationError?(generationError.code||'GENERATION_FAILED'):remaining()<=20_000?'TIME_BUDGET':undefined;
+  const refinement=textRework?{target:refinementTarget,completed:Math.max(0,acceptedCount-1),qualified:acceptedCount>0,complete:acceptedCount>=1+refinementTarget}:undefined;
+  const logId = await logAttempt({ code: final.code || "", mode: opts.mode || "text", perPanel: opts.perPanel, panelIndex: opts.panelIndex, attempt, model: opts.model, compile: final.compiled, reconstruction:{history,checks:final.checks,review:final.visual,refinement,stopReason}, durationMs: Date.now() - started });
   if (logId) yield { type: "log", logId };
   const visualOk = opts.reviewer === false || final.visual?.pass === true;
   const ok = Boolean(final.compiled && final.compiled.ok) && visualOk && final.checks.ok;
   yield {
     type: "done", ok, code: final.code,
     errors: [...((final.compiled && final.compiled.errors) || []), ...final.checks.issues.map(i=>({line:null,message:i.message}))],
-    reason: ok ? undefined : (!final.compiled?.ok ? "COMPILE_FAILED" : !final.checks.ok ? 'FIGURE_VALIDATION_FAILED' : !final.visual ? "REVIEW_UNAVAILABLE" : "REVIEW_REJECTED"),
-    model: opts.model, attempts: attempt, rounds: attempt, representation: opts.representation || "native",
+    reason: ok ? undefined : (stopReason || (!best&&constructionError ? 'COMPOSITION_FAILED' : !final.compiled?.ok ? "COMPILE_FAILED" : !final.checks.ok ? 'FIGURE_VALIDATION_FAILED' : !final.visual ? "REVIEW_UNAVAILABLE" : "REVIEW_REJECTED")),
+    model: opts.model, attempts: reviewCount, rounds: attempt, refinement, stopReason, timedOut:stopReason==='TIME_BUDGET', representation: opts.representation || "native",
     versions, geometry: null, checks:final.checks,
     visual: final.visual ? { score: final.visual.score, pass: final.visual.pass, issues: final.visual.issues } : null,
     durationMs: Date.now() - started,

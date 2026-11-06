@@ -286,6 +286,7 @@ function aiPayload(req) {
     imageRepresentation: requireRepresentation(representation),
     reviewer: reviewer !== false,
     maxAttempts: Math.max(1, Math.min(6, Number(maxAttempts) || 1)),
+    refinementPasses: req.body?.refinementPasses == null ? undefined : Math.max(0,Math.min(5,Math.floor(Number(req.body.refinementPasses)||0))),
     engine,
     apiKey: (req.get("x-ai-key") || "").trim() || String(req.body?.apiKey || "").trim(),
   };

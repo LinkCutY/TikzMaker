@@ -44,6 +44,8 @@ export interface Understanding {
 }
 
 export interface AiStreamEvent {
+  refinement?: {target:number;completed:number;qualified:boolean;complete:boolean};
+  stopReason?: string;
   type: "step" | "code" | "diagnostics" | "lint" | "review" | "diff" | "budget" | "log" | "understanding" | "done" | "error" | "end";
   id?: string;
   label?: string;
@@ -70,7 +72,8 @@ export interface AiStreamEvent {
   instructions?: string;
   stats?: Record<string, unknown>;
   /** Why the run stopped without a result. */
-  reason?: "TIMEOUT" | "TIME_BUDGET" | "REVIEW_REJECTED" | "REVIEW_UNAVAILABLE" | "COMPILE_FAILED" | "GEOMETRY_REJECTED" | "SCENE_REJECTED" | "APPROXIMATION_REQUIRED" | "STUCK";
+  reason?: "TIMEOUT" | "TIME_BUDGET" | "REVIEW_REJECTED" | "REVIEW_UNAVAILABLE" | "COMPILE_FAILED" | "GEOMETRY_REJECTED" | "SCENE_REJECTED" | "APPROXIMATION_REQUIRED" | "STUCK" | "COMPOSITION_FAILED" | "FIGURE_VALIDATION_FAILED" | "CANCELLED";
+  checks?: {ok:boolean;composition?:{requirements:{id:string;text:string;objects:string[]}[]}};
   stuck?: boolean;
   /** The last reply hit the output limit (figure was cut off). */
   truncated?: boolean;
@@ -254,6 +257,7 @@ export const api = {
       temperature?: number;
       canvasMode?: boolean;
       maxAttempts?: number;
+      refinementPasses?: number;
       engine?: string;
       reviewer?: boolean;
       /**

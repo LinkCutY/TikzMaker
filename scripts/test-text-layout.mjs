@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import {compileComposition} from '../server/text-validation.mjs';
+import {meanValuePlan} from './fixtures/text-composition.mjs';
+const plan=structuredClone(meanValuePlan);
+plan.objects.push({id:'formula',kind:'label',at:{ref:'f',anchor:'north'},offset:[0,.5],text:'$f(x)$'});
+plan.objects.push({id:'axisXi',kind:'label',at:{project:'xi',axis:'x'},offset:[0,-.3],text:'$\\xi$'});
+plan.objects.push({id:'curvePoint',kind:'point',at:{on:'f',x:2},radiusPt:2});
+plan.constraints.push({kind:'above',a:'formula',b:'f'},{kind:'above',a:'formula',b:{ref:'f',anchor:'north'}},{kind:'onCurve',point:'curvePoint',curve:'f'});
+const built=await compileComposition(plan),get=id=>built.figure.elements.find(e=>e.id===id);
+assert.ok(Math.abs(get('axisXi').at.x-get('xi').center.x)<1e-7);assert.equal(get('axisXi').at.y,-.3);
+assert.ok(Math.abs(get('curvePoint').radius-2*2.54/72.27)<1e-10);
+assert.ok(get('formula').at.y>8,'layout uses real curve bounds, not fixed plot range');
+const malformed=structuredClone(plan);malformed.objects.find(o=>o.id==='curvePoint').radiusPt=undefined;malformed.objects.find(o=>o.id==='curvePoint').radius=2;
+malformed.constraints.push({kind:'perpendicular',a:'chord',b:'tangent'});
+await assert.rejects(()=>compileComposition(malformed),e=>/radius.*cm/.test(e.message)&&/perpendicular/.test(e.message),'report independent problems together');
+const ambiguous=structuredClone(plan);ambiguous.objects.find(o=>o.id==='curvePoint').at='f';await assert.rejects(()=>compileComposition(ambiguous),/for a function use/);
+const tooLow=structuredClone(plan);tooLow.objects.find(o=>o.id==='formula').offset=[0,-.5];await assert.rejects(()=>compileComposition(tooLow),/unsatisfied constraint/,'do not waive false above relation');
+console.log('layout references, function anchors, computed axis projection, point units and aggregated diagnostics passed');

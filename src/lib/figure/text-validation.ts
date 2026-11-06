@@ -1,6 +1,7 @@
 import {parseBodySafe} from './bridge';
 import {compileExpr} from './expr';
 import type {Figure, Pt} from './types';
+export {compileComposition} from './composition';
 
 const distance=(a:Pt,b:Pt)=>Math.hypot(a.x-b.x,a.y-b.y);
 /** Numerical witness check on the ACTUAL drawable objects, not a model's
