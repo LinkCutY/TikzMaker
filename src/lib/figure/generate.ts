@@ -113,7 +113,7 @@ export function elementToTikz(el: Element): string[] {
       const e = el as NodeEl;
       const extra: string[] = [];
       if (e.boxed) {
-        extra.push("draw");
+        extra.push(e.style.color === "black" ? "draw" : `draw=${tikzColor(e.style.color)}`);
         if (e.style.fill) extra.push(`fill=${tikzColor(e.style.fill)}`);
         if (e.rounded > 0) extra.push(`rounded corners=${fmtNum(e.rounded)}cm`);
         extra.push("inner sep=4pt");
@@ -129,7 +129,7 @@ export function elementToTikz(el: Element): string[] {
       if (/\\(?:frac|sqrt|sum|int|sin|cos|tan|alpha|beta|gamma|delta|theta|pi|sigma|omega|langle|rangle)\b/.test(text) && !/\$/.test(text)) text = `$${text}$`;
       // Nodes use text= for glyph color; draw= only colors their border.
       extra.push(`text=${tikzColor(e.style.color)}`);
-      return [`\\node${styleOpts({ ...e.style, fill: null, arrow: "none" }, false, extra)} at ${pt(e.at)} {${escapeText(text)}};`];
+      return [`\\node${styleOpts({ ...e.style, color: "black", fill: null, arrow: "none" }, false, extra)} at ${pt(e.at)} {${escapeText(text)}};`];
     }
     case "axes": {
       const e = el as AxesEl;

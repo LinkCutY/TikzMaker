@@ -10,6 +10,13 @@ const source={type:'mixed',objects:[
  {id:'cell',kind:'rect',box:[600,100,200,200],style:{stroke:'#000000',fill:'#ffff00'}},
 ]};
 assert.equal(validateScene(source).ok,true);
+const axisWithoutConnection=validateScene({type:'plot',objects:[
+ {id:'xaxis',kind:'path',role:'axis',points:[[10,900],[900,900]],style:{stroke:'#000000'}},
+ {id:'ytick',kind:'path',role:'tick',points:[[10,800],[25,800]],style:{stroke:'#000000'}}]});
+assert.equal(axisWithoutConnection.ok,true);
+assert.equal(axisWithoutConnection.scene.objects[0].connection,'linear');
+assert.equal(axisWithoutConnection.scene.objects[1].connection,'linear');
+assert.equal(validateScene({type:'plot',objects:[{id:'curve',kind:'path',role:'data',points:[[10,20],[30,40]],style:{stroke:'#000000'}}]}).ok,false,'data curves still require an explicit connection');
 const {code}=compileScene(source,{width:500,height:400});
 assert.equal((code.match(/\{0\};/g)||[]).length,2,'equal labels at different locations survive');
 assert.equal((code.match(/% object/g)||[]).length,source.objects.length);

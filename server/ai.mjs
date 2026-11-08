@@ -2125,7 +2125,6 @@ async function* runGenerationInner(opts) {
         preserveRequirements(composition,contract);
         contract ||= requirementContract(composition);
         preserveConstraints(composition,constraintContract);
-        if(!constraintContract&&Array.isArray(composition.constraints)&&composition.constraints.every(c=>c&&['parallel','perpendicular','equalLength','onCurve','leftOf','above'].includes(c.kind)))constraintContract=structuredClone(composition.constraints);
         const built=await compileComposition(composition);
         contract ||= structuredClone(built.requirements);
         constraintContract ||= structuredClone(composition.constraints);

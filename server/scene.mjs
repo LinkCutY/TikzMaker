@@ -96,6 +96,9 @@ export function validateScene(input){
     }else if(o.kind==='path'){
       paths++;
       if(o.shape?.monotone!=null&&!['increasing','decreasing','none'].includes(o.shape.monotone))bad('shape.monotone must describe image y: increasing, decreasing or none');
+      // Two endpoints fully determine an axis or tick. Models occasionally
+      // omit the redundant connection field for these simple primitives.
+      if(o.connection==null&&['axis','tick'].includes(o.role)&&Array.isArray(o.points)&&o.points.length===2&&o.points.every(xy))o.connection='linear';
       if(!['linear','smooth','step','none','bezier'].includes(o.connection))bad('explicit connection required');
       if(o.connection==='bezier'){
         if(!xy(o.start)||!Array.isArray(o.segments)||!o.segments.length||o.segments.length>SCENE_LIMITS.segments||o.segments.some(s=>!Array.isArray(s)||s.length!==3||!s.every(xy)))bad('bounded cubic segments required');

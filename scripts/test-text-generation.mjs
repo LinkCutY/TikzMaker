@@ -24,6 +24,7 @@ const provider=http.createServer(async(req,res)=>{
       generations++;
       let plan=structuredClone(scenario==='mean-value'?meanValuePlan:scenario==='flow'?flowPlan:squarePlan);
       if(scenario==='construction-repair'&&generations===1)plan.objects[0].size=-2;
+      if(scenario==='constraint-repair'&&generations===1)plan.constraints=[{kind:'above',a:'square',b:'square'}];
       if(scenario==='qualification-loop'&&generations<=3)plan.objects[0].size=-2;
       if(scenario==='cannot-delete'){
         if(generations===1)plan.objects[0].size=-2;
@@ -56,6 +57,7 @@ try{
   const repair=await run('repair');assert.equal(repair.done.ok,true);assert.equal(repair.done.rounds,2);assert.ok(repair.calls[2].messages[1].content.includes('Keep equal side lengths'));
   assert.ok(repair.calls[2].messages[1].content.includes('Previous construction to repair'));assert.ok(repair.done.checks.composition.requirements.length);
   const cr=await run('construction-repair',{reviewer:false});assert.equal(cr.done.ok,true);assert.equal(cr.done.rounds,2);
+  const constraintRepair=await run('constraint-repair',{reviewer:false});assert.equal(constraintRepair.done.ok,true);assert.equal(constraintRepair.done.rounds,2);
   const deletion=await run('cannot-delete',{reviewer:false});assert.equal(deletion.done.ok,false);assert.equal(deletion.done.reason,'CANCELLED');assert.match(deletion.done.errors[0].message,/restore original requirement/);
   const looping=await run('qualification-loop',{maxAttempts:1,refinementPasses:1});assert.equal(looping.done.ok,true);assert.equal(looping.done.rounds,7);assert.equal(looping.done.attempts,4);assert.deepEqual(looping.done.refinement,{target:1,completed:1,qualified:true,complete:true});
   const kept=await run('preserve-qualified',{refinementPasses:2});assert.equal(kept.done.ok,true);assert.ok(kept.done.code.includes('rectangle'));assert.equal(kept.done.refinement.complete,false);assert.equal(kept.done.stopReason,'BAD_KEY');

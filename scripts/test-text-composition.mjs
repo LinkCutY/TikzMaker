@@ -3,6 +3,7 @@ import {compileComposition,validateTextFigure} from '../server/text-validation.m
 import {preserveRequirements} from '../server/text-composition.mjs';
 import {squarePlan,flowPlan,meanValuePlan} from './fixtures/text-composition.mjs';
 const square=await compileComposition(squarePlan);assert.match(square.code,/rectangle \(2,2\)/);
+const coloredLabel=structuredClone(squarePlan);coloredLabel.objects.push({id:'colored',kind:'label',at:[1,1],text:'(\\textcolor{red}{3},\\textcolor{blue}{3})',style:{color:'blue'}});const colored=await compileComposition(coloredLabel);assert.match(colored.code,/text=blue/);assert.doesNotMatch(colored.code,/\\node\[draw=blue/);assert.match(colored.code,/\\textcolor\{red\}\{3\}/);
 const flow=await compileComposition(flowPlan),edge=flow.figure.elements.find(e=>e.id==='e1');assert.deepEqual(edge.from,{x:1,y:0});assert.deepEqual(edge.to,{x:3,y:0});assert.equal(edge.style.arrow,'->');
 const moved=structuredClone(flowPlan);moved.objects.find(o=>o.id==='process').at=[5,2];const m=await compileComposition(moved);const e=m.figure.elements.find(e=>e.id==='e1');assert.ok(e.from.y>0&&e.to.y>0,'connections follow relocated boxes');
 const mv=await compileComposition(meanValuePlan),xi=mv.figure.elements.find(e=>e.id==='xi');assert.ok(Math.abs(xi.center.x-2.95)<1e-6);
